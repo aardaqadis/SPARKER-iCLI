@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparker-icli"
+version = "0.5.2"
+description = "SPARKER iCLI — a minimal terminal image editor and command studio"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = ["textual>=8,<9", "Pillow>=12,<13"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=1"]
+
+[project.scripts]
+sparker = "termatelier.__main__:main"
+sparkericli = "termatelier.__main__:main"
+termatelier = "termatelier.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+termatelier = ["assets/*.png"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,12 @@
+# SPARKER iCLI command study. Paths are relative to this script.
+new 160x100 --color #0b0b0b
+layer add "Orange mark"
+rectangle 12 42 144 78 --filled --color #e79335
+layer add "Lettering"
+text 12 12 "SPARKER iCLI" --size 18 --color white
+text 14 47 "IMAGE / COMMAND / STUDIO" --size 9 --color #0b0b0b
+meta title "SPARKER command study"
+meta author "SPARKER iCLI"
+save poster.tart
+export poster.png
+export poster.txt --columns 80

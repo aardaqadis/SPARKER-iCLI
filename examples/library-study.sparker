@@ -1,0 +1,20 @@
+# A layered study using the executable art-tool library.
+# Native save is beside this script; image/text exports use the external export folder.
+new 320x200 --color #0b0b0b
+layer rename "Texture"
+apply tessellation.brick.stepped.outline --size 24 --color #353535 --opacity 45%
+layer add "Dry brush"
+apply natural-media.grass.slash.striated 35,135 65,115 95,145 125,130 155,155 --size 32 --color #e79335 --opacity 80% --seed 7
+layer add "Leaf ornaments"
+apply botanical.oak.wreath.net 245,115 --size 90 --color #f5eee2
+apply botanical.lance.single.midrib 205,166 230,176 260,174 --size 32 --angle 20 --color #e79335
+layer add "Rosette"
+apply rosettes.heart.spiral.star 85,92 --size 60 --color #e79335
+layer add "Lettering"
+text 18 15 "SPARKER iCLI" --size 26 --color white
+text 20 48 "STAMP / BRUSH / PATTERN" --size 11 --color #e79335
+meta title "Library study"
+meta author "SPARKER iCLI"
+save library-study.tart
+export library-study.png
+export library-study.txt --columns 100

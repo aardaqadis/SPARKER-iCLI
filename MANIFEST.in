@@ -1,0 +1,15 @@
+include LICENSE README.md COMMANDS.md FORMAT.md PERFORMANCE.md TESTING.md
+include TOOLS.md TOOLS.json requirements-tested.txt run.cmd run.ps1
+include preview.png preview.svg menu-preview.png command-preview.png
+include tool-browser-preview.png tool-library.png
+recursive-include src *.py *.png
+recursive-include tests *.py
+recursive-include tools *.py
+recursive-include examples *.sparker *.tart *.png *.txt *.ansi
+prune .venv
+prune work
+prune .idea
+prune build
+prune dist
+global-exclude *.py[cod]
+exclude painting.jpeg file-explorer-preview.png
