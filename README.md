@@ -2,9 +2,12 @@
 
 <img src="src/termatelier/assets/logo.png" alt="SPARKER iCLI" width="420">
 
-A minimalist terminal image editor with mouse drawing, a full-screen command
-workspace, and **1,248 procedural art recipes and effects**. Paint interactively
-or use repeatable commands and scripts against the same layered RGBA document.
+Ever had the need to have MS paint in your command prompt? No? Download it anyway!
+
+SPARKER iCLI is a minimalist terminal image editor for mouse painting and digital
+pixel art, with a full-screen command workspace and **1,248 procedural art recipes
+and effects**. Paint interactively or use repeatable commands and scripts against
+the same layered RGBA document.
 
 ![The terminal painting studio](preview.png)
 
