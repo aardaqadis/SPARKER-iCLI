@@ -13,6 +13,10 @@ channels, text source editing and layer effect stacks. Type `features` for
 the tool families and their limits; these use SPARKER's own raster algorithms.
 
 ## Start
+=======
+=======
+SPARKER iCLI is a raster canvas editor inside of any command line interface. Consuming less memory than Microsoft paint, it offers an optimised way of digitally producing art.
+
 
 Install **Python 3.11+**, then run from this folder:
 
