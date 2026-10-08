@@ -1,6 +1,29 @@
+# Local environments, Python caches and generated packages
 .venv/
+venv/
 __pycache__/
+*.py[cod]
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 build/
 dist/
+
+# Scratch work, runtime diagnostics and local editor state
+work/
+.idea/
+.vscode/
+.env
+.env.*
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Personal artwork and an older screenshot with a machine-specific address
+/painting.jpeg
+/file-explorer-preview.png

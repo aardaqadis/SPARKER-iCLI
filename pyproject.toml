@@ -15,6 +15,10 @@ dependencies = ["textual>=8,<9", "Pillow>=12,<13"]
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=1"]
 
+[project.urls]
+Repository = "https://github.com/aardaqadis/SPARKER-iCLI"
+Issues = "https://github.com/aardaqadis/SPARKER-iCLI/issues"
+
 [project.scripts]
 sparker = "termatelier.__main__:main"
 sparkericli = "termatelier.__main__:main"

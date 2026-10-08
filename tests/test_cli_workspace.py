@@ -388,10 +388,14 @@ def test_explorer_command_quoting_preserves_spaces_quotes_and_windows_backslashe
 
 async def choose_explorer_path(pilot, app, path):
     from termatelier.file_explorer import FileExplorer
+    from textual.widgets import Button
     await pilot.pause()
     assert isinstance(app.screen, FileExplorer)
     app.screen.query_one("#path", Input).value = str(path)
     await pilot.pause()
+    # Button ignores another click until its active animation ends. An idle
+    # message queue alone does not advance that timer on faster platforms.
+    await pilot.pause(app.screen.query_one("#file-submit", Button).active_effect_duration + .02)
     assert await pilot.click("#file-submit")
     await pilot.pause()
 

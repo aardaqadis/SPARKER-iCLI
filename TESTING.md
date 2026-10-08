@@ -6,7 +6,8 @@ Verified on **7 October 2026** with Windows, Python **3.14.6**, Textual
 **582 tests passed, 1 skipped** across model/storage, CLI commands, preferences,
 terminal UI, file explorer, tool library, detached preview and startup lifecycle tests. The one skipped test
 requires directory symlink creation, unavailable under this Windows account.
-The complete final suite passed after all code changes in 154.55 seconds.
+The original release suite passed in 154.55 seconds. Subsequent clean-repository
+verification is recorded below.
 
 Coverage includes pixel alpha and blend modes, selections, painting, masks,
 filters, transforms, clipboard, layer management, undo/redo, bounded history,
@@ -167,14 +168,38 @@ The isolated installed wheel also passed a 1024×768 soft stroke, undo/redo,
 native save and exact full-size PNG export. A real SGR drag in its packaged
 Canvas preserved continuous 1-pixel brush coverage at Fit and one undo step.
 
-The repository-root `run.cmd` and `run.ps1` forward into the `Termatelier/`
-Python project; the application and public commands use SPARKER iCLI.
+The repository-root `run.cmd` and `run.ps1` prepare the local environment and
+open SPARKER iCLI. The internal `termatelier` module name remains compatible.
 
-Linux/macOS, Python 3.11 and physical mouse input in every terminal were not
-tested here. Headless tests exercise terminal mouse events; the native terminal
+macOS, Python 3.11 and physical mouse input in every terminal were not
+tested locally. Headless tests exercise terminal mouse events; the native terminal
 smoke test checks startup, rendering and clean exit. Color accuracy on different
 monitors is not claimed. Large-canvas performance
 measurements and their practical scope are recorded in [PERFORMANCE.md](PERFORMANCE.md).
+
+## GitHub preparation — 8 October 2026
+
+The 81 tracked source files were exported from Git's index into a clean checkout
+without the development environment, scratch work, diagnostics or personal
+artwork. Checks ran against that checkout rather than depending on local files.
+
+- Windows, Python 3.14.6: **582 passed, 1 skipped** in 129.61 seconds.
+  After making repeated test clicks wait for Textual's button animation, all
+  **19 command-workspace tests** passed again on Windows.
+- Headless Ubuntu through WSL, Python 3.14.4: **578 passed, 5 skipped** in
+  104.75 seconds. The skips require native display/Windows integration.
+- Both used Textual 8.2.8, Pillow 12.3.0, pytest 9.1.1 and pytest-asyncio 1.4.0.
+- An isolated build produced a wheel and source distribution with the original
+  logo, Markdown package description and MIT license metadata. The installed
+  wheel passed public-module/help, 1,248-tool count and pixel-exact 31×19 PNG checks.
+- Tracked files, documentation links, workflow YAML, image/license assets and
+  distribution contents were checked. Local artwork and runtime files remain
+  on disk and are excluded from tracking.
+
+GitHub Actions is configured for Windows and Ubuntu with Python 3.11 and 3.14,
+using the verified runtime dependency versions. It builds both distributions
+and checks the installed wheel. The hosted workflow has not run for this local
+preparation; its results will appear after the commit is pushed to GitHub.
 
 ## Repeat
 
