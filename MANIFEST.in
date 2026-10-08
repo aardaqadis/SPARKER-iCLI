@@ -1,7 +1,6 @@
-include LICENSE README.md COMMANDS.md FORMAT.md PERFORMANCE.md TESTING.md
-include USAGE.md CONTRIBUTING.md CHANGELOG.md PUBLISHING.md
-include TOOLS.md TOOLS.json requirements-tested.txt run.cmd run.ps1
-include preview.png preview.svg menu-preview.png command-preview.png
+include LICENSE README.md
+include TOOLS.json requirements-tested.txt run.cmd run.ps1 run.py run.sh
+include preview.svg menu-preview.png command-preview.png
 include tool-browser-preview.png tool-library.png
 recursive-include src *.py *.png
 recursive-include tests *.py

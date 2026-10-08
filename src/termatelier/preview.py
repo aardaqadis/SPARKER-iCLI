@@ -26,6 +26,16 @@ PREVIEW_DEFAULTS = {
 }
 
 
+def desktop_available():
+    """Whether Tk can reach a desktop, without importing it or opening a window.
+
+    Native macOS Tk uses Aqua and Windows Tk does not need a display variable.
+    Unix Tk uses X11, including XWayland; WAYLAND_DISPLAY alone is insufficient.
+    Actual Tk availability is checked by the optional helper when it starts.
+    """
+    return os.name == "nt" or sys.platform == "darwin" or bool(os.environ.get("DISPLAY"))
+
+
 def atomic_json(path, data):
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
@@ -94,12 +104,19 @@ class PreviewController:
             if not self._options()["enabled"]:
                 self.close()
                 return False
+            if not desktop_available():
+                self.close()
+                self.error = "No desktop display is available; use the terminal painting view."
+                return False
             if self.running:
                 return self.update(document, metadata)
             self.close()
             self.error = ""
             try:
-                self._temporary = tempfile.TemporaryDirectory(prefix="sparker-preview-")
+                # Windows can expose TEMP through an 8.3 alias. Publish the
+                # canonical directory so IPC and diagnostic paths agree.
+                self._temporary = tempfile.TemporaryDirectory(
+                    prefix="sparker-preview-", dir=Path(tempfile.gettempdir()).resolve())
                 self._generation = 0
                 self._frames = []
                 self._snapshot(document, metadata)

@@ -4,12 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sparker-icli"
-version = "0.5.2"
+version = "0.5.3"
 description = "SPARKER iCLI — a minimal terminal image editor and command studio"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
+classifiers = [
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Multimedia :: Graphics :: Editors :: Raster-Based",
+]
 dependencies = ["textual>=8,<9", "Pillow>=12,<13"]
 
 [project.optional-dependencies]

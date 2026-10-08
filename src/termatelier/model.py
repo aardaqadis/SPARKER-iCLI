@@ -11,6 +11,7 @@ import copy
 from functools import lru_cache
 import math
 from collections import deque
+import zlib
 
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
@@ -76,6 +77,53 @@ class Layer:
         return result
 
 
+@dataclass(frozen=True)
+class _HistoryImage:
+    """Lossless pixel storage for completed checkpoints, never live artwork."""
+
+    mode: str
+    size: tuple[int, int]
+    data: bytes
+    compressed: bool
+
+    @classmethod
+    def capture(cls, image):
+        if image is None or isinstance(image, cls):
+            return image
+        pixels = image.tobytes()
+        compressed = zlib.compress(pixels, level=1)
+        # Imported photographs and noise may not compress. Avoid increasing
+        # their payload, while retaining the same lossless restoration path.
+        use_compressed = len(compressed) < len(pixels)
+        return cls(image.mode, image.size, compressed if use_compressed else pixels, use_compressed)
+
+    def restore(self):
+        pixels = zlib.decompress(self.data) if self.compressed else self.data
+        return Image.frombytes(self.mode, self.size, pixels)
+
+
+@dataclass(frozen=True)
+class _HistoryLayer:
+    name: str
+    image: _HistoryImage
+    visible: bool
+    locked: bool
+    opacity: float
+    blend: str
+    mask: _HistoryImage | None
+
+    @classmethod
+    def capture(cls, layer):
+        if isinstance(layer, cls):
+            return layer
+        return cls(layer.name, _HistoryImage.capture(layer.image), layer.visible,
+                   layer.locked, layer.opacity, layer.blend, _HistoryImage.capture(layer.mask))
+
+    def restore(self):
+        return Layer(self.name, self.image.restore(), self.visible, self.locked,
+                     self.opacity, self.blend, self.mask.restore() if self.mask else None)
+
+
 def composite_layer(back, front, blend="normal"):
     """Blend RGB in the overlap, then source-over with correct transparent areas."""
     if blend == "normal":
@@ -112,6 +160,7 @@ class Document:
         self.clipboard = None
         self.history_limit = 40
         self.history_bytes = 96 * 1024 * 1024
+        self._history_storage = "raw"
 
     @property
     def size(self):
@@ -125,16 +174,70 @@ class Document:
     def dirty(self):
         return self.revision != self.saved_revision
 
+    @property
+    def history_storage(self):
+        return self._history_storage
+
+    @history_storage.setter
+    def history_storage(self, storage):
+        """Choose future checkpoint storage, compacting existing history on opt-in.
+
+        Existing compressed checkpoints remain compressed when returning to raw
+        storage. Mixed histories restore identically without expanding memory
+        just to change a preference. Pending edits stay raw for brush access.
+        """
+        if storage not in ("raw", "compressed"):
+            raise ValueError("History storage must be raw or compressed.")
+        if storage == "compressed":
+            self.undo_stack = [(label, self._pack_snapshot(state)) for label, state in self.undo_stack]
+            self.redo_stack = [(label, self._pack_snapshot(state)) for label, state in self.redo_stack]
+        self._history_storage = storage
+
+    @staticmethod
+    def _pack_snapshot(state):
+        size, layers, active, selection, metadata, settings, revision = state
+        return (size, [_HistoryLayer.capture(layer) for layer in layers], active,
+                _HistoryImage.capture(selection), metadata, settings, revision)
+
+    @staticmethod
+    def _snapshot_bytes(state):
+        """Stored pixel payload, including masks and selections in either mode."""
+        def image_bytes(image):
+            if image is None:
+                return 0
+            if isinstance(image, _HistoryImage):
+                return len(image.data)
+            return image.width * image.height * len(image.getbands())
+
+        _, layers, _, selection, *_ = state
+        return sum(image_bytes(layer.image) + image_bytes(layer.mask) for layer in layers) + image_bytes(selection)
+
+    @property
+    def history_memory_bytes(self):
+        """Pixel bytes retained by undo and redo; excludes the current artwork."""
+        return sum(self._snapshot_bytes(state) for _, state in self.undo_stack + self.redo_stack)
+
     def snapshot(self):
+        """Independent public state used by transactions and command rollback."""
         return (self.size, [layer.clone() for layer in self.layers], self.active,
                 self.selection.copy() if self.selection else None,
                 copy.deepcopy(self.metadata), copy.deepcopy(self.settings), self.revision)
 
+    def _history_snapshot(self):
+        if self.history_storage == "raw":
+            return self.snapshot()
+        # Encode live images directly instead of creating a second set of full
+        # Pillow buffers while capturing undo/redo in the memory-saving mode.
+        return (self.size, [_HistoryLayer.capture(layer) for layer in self.layers], self.active,
+                _HistoryImage.capture(self.selection), copy.deepcopy(self.metadata),
+                copy.deepcopy(self.settings), self.revision)
+
     def restore(self, state):
         size, layers, self.active, selection, metadata, settings, self.revision = state
         self.width, self.height = size
-        self.layers = [layer.clone() for layer in layers]
-        self.selection = selection.copy() if selection else None
+        self.layers = [layer.restore() if isinstance(layer, _HistoryLayer) else layer.clone() for layer in layers]
+        self.selection = (selection.restore() if isinstance(selection, _HistoryImage)
+                          else selection.copy() if selection else None)
         self.metadata, self.settings = copy.deepcopy(metadata), copy.deepcopy(settings)
 
     def begin(self, label):
@@ -145,7 +248,9 @@ class Document:
     def commit(self):
         if self.pending is None:
             return
-        self.undo_stack.append(self.pending)
+        label, state = self.pending
+        self.undo_stack.append((label, self._pack_snapshot(state))
+                               if self.history_storage == "compressed" else self.pending)
         self.pending = None
         self.redo_stack.clear()
         self.serial += 1
@@ -153,19 +258,18 @@ class Document:
         self._trim()
 
     def _trim(self):
-        def cost(entry):
-            size, layers, _, selection, *_ = entry[1]
-            return size[0] * size[1] * (sum(4 + (x.mask is not None) for x in layers) + (selection is not None))
+        total_bytes = self.history_memory_bytes
         # Redo snapshots consume the same memory as undo snapshots. Discard the
         # farthest checkpoints first, retaining the next undo/redo when possible.
         while (len(self.undo_stack) + len(self.redo_stack) > self.history_limit or
-               sum(map(cost, self.undo_stack + self.redo_stack)) > self.history_bytes):
+               total_bytes > self.history_bytes):
             if self.undo_stack:
-                self.undo_stack.pop(0)
+                _, state = self.undo_stack.pop(0)
             elif self.redo_stack:
-                self.redo_stack.pop(0)
+                _, state = self.redo_stack.pop(0)
             else:
                 break
+            total_bytes -= self._snapshot_bytes(state)
 
     def cancel(self):
         if self.pending:
@@ -189,7 +293,7 @@ class Document:
         if not self.undo_stack:
             return False
         label, state = self.undo_stack.pop()
-        self.redo_stack.append((label, self.snapshot()))
+        self.redo_stack.append((label, self._history_snapshot()))
         self.restore(state)
         self._trim()
         return True
@@ -200,7 +304,7 @@ class Document:
         if not self.redo_stack:
             return False
         label, state = self.redo_stack.pop()
-        self.undo_stack.append((label, self.snapshot()))
+        self.undo_stack.append((label, self._history_snapshot()))
         self.restore(state)
         self._trim()
         return True

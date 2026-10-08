@@ -9,6 +9,7 @@ from .config import RuntimeConfig, parse_overrides
 from .diagnostics import publish_diagnostics
 from .model import Document
 from .storage import export, import_document, load_project, save_project
+from .terminal import configure_output, print_text as print, ui_unavailable_reason
 
 
 def demo_document():
@@ -76,11 +77,12 @@ def repl(session):
 
 
 def main(argv=None):
+    configure_output()
     parser = argparse.ArgumentParser(
         prog="sparker", description="SPARKER iCLI — minimalist terminal painting and image editing",
         epilog='Examples: sparker --cli | sparker --new 128x96 -c "fill 0 0 --color orange" --export art.png | sparker --script artwork.sparker\n'
                'With editing commands, the default is headless. Add --ui to open the editor afterward.\n'
-               'Command help: sparker -c help. See COMMANDS.md for the full reference.',
+               'Command help: sparker -c help or sparker -c "help COMMAND". See README.md for examples.',
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("file", nargs="?", help="Native .tart project or image to open")
     parser.add_argument("--new", metavar="WxH", help="New canvas, e.g. 160x100")
@@ -88,6 +90,7 @@ def main(argv=None):
     parser.add_argument("--export", metavar="PATH", nargs="?", const="", help="Export outside the project; omitted PATH uses a PNG filename")
     parser.add_argument("--allow-lossy", action="store_true", help="Allow JPEG/GIF/BMP export; all image dimensions are preserved")
     parser.add_argument("--set", metavar="NAME=VALUE", action="append", help="Override a validated preference for this run; repeatable")
+    parser.add_argument("--low-memory", action="store_true", help="Compress undo, limit it to 8 steps / 16 MiB, and disable desktop helpers; original image pixels are preserved")
     debug = parser.add_mutually_exclusive_group()
     debug.add_argument("--debug", action="store_true", help="Show the transparent desktop debug overlay")
     debug.add_argument("--no-debug", action="store_true", help="Start with the debug overlay hidden")
@@ -108,6 +111,8 @@ def main(argv=None):
         parser.error("Choose one input: file, --new or --demo.")
     try:
         overrides = parse_overrides(args.set)
+        if args.low_memory:
+            overrides["memory.mode"] = "low"
         if args.debug or args.no_debug:
             overrides["debug.enabled"] = args.debug
         config = RuntimeConfig.load(overrides=overrides)
@@ -150,13 +155,20 @@ def main(argv=None):
             print(json.dumps({"size": doc.size, "active": doc.active, "metadata": doc.metadata,
                               "layers": [{"name": x.name, "visible": x.visible, "opacity": x.opacity,
                                           "blend": x.blend, "masked": x.mask is not None} for x in doc.layers]}, indent=2))
-        if args.cli and sys.stdin.isatty() and sys.stdout.isatty():
+        unavailable = ui_unavailable_reason()
+        if args.cli and unavailable is None:
             from .cli_app import CLIApp
             CLIApp(session).run()
             return 0
         if args.cli or args.repl:
+            if args.cli and unavailable and sys.stdin.isatty():
+                print(f"Using the line CLI: {unavailable}.", file=sys.stderr)
             return repl(session)
         if not args.ui and (operations or has_export or args.save_project or args.inspect): return 0
+        if unavailable:
+            if sys.stdin.isatty():
+                print(f"Using the line CLI: {unavailable}. Type help for editing commands.", file=sys.stderr)
+            return repl(session)
         from .app import Studio
         Studio(doc, session.project_path, config=config).run()
         return 0

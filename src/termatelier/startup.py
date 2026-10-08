@@ -199,9 +199,10 @@ def format_debug_text(state: dict[str, Any], diagnostics: dict[str, Any], *,
     append("Runtime stage", diagnostics.get("startup", {}).get("stage"))
     append("Working directory", program.get("working_directory"))
     memory = program.get("memory_bytes")
-    append("Memory / uptime", f"{memory / 1048576:.1f} MiB / {program.get('uptime_seconds', '?')}s" if isinstance(memory, (int, float)) else f"unavailable / {program.get('uptime_seconds', '?')}s")
+    append("Memory / uptime", f"{memory / 1048576:.1f} MiB {program.get('memory_kind', 'resident')} / {program.get('uptime_seconds', '?')}s" if isinstance(memory, (int, float)) else f"unavailable / {program.get('uptime_seconds', '?')}s")
     append("pyvenv.cfg", f"{'present' if venv.get('config_exists') else 'missing'} · {venv.get('config_path', '?')}")
     append("Prefix", venv.get("prefix"))
+    append("Active environment", venv.get("active_path"))
     append("Base prefix", venv.get("base_prefix"))
     for key in ("version", "home", "executable", "include-system-site-packages"):
         append(f"Venv {key}", venv.get("config", {}).get(key))
@@ -356,6 +357,11 @@ def show_startup(state_path: Path, parent_pid: int, logo_path: Path, *,
                     x = cycle if cycle <= span else 2 * span - cycle
                     progress.coords(pulse, x, 0, x + 70, 2)
                     tick += 7
+            # No color-key overlay is available on this desktop. Once the logo
+            # closes, an invisible Tk process has no work left to perform.
+            if splash is None and not transparent_supported:
+                root.destroy()
+                return
             if now >= next_debug:
                 config = RuntimeConfig.load(overrides=overrides)
                 snapshot = read_state(debug_path) if debug_path else {}
@@ -365,6 +371,11 @@ def show_startup(state_path: Path, parent_pid: int, logo_path: Path, *,
                     # The editor owns session overrides; `debug on` also works
                     # after a --no-debug launch without restarting the helper.
                     config = RuntimeConfig.load(overrides=live_settings)
+                if config.get("memory.mode", "standard") == "low":
+                    # Switching a running session to low memory also releases
+                    # this helper, rather than retaining a hidden Tk process.
+                    root.destroy()
+                    return
                 next_debug = now + int(config.get("debug.refresh_ms")) / 1000
                 enabled = (bool(config.get("debug.enabled")) and
                            (not no_debug or bool(live_settings)) and transparent_supported)
@@ -417,6 +428,7 @@ def main(argv: list[str] | None = None) -> int:
         override_names = set(existing) | set(overrides)
         print(json.dumps({"minimum_seconds": config.get("startup.minimum_seconds"),
                           "debug_enabled": config.get("debug.enabled"),
+                          "memory_mode": config.get("memory.mode", "standard"),
                           "overrides": {name: config.get(name) for name in sorted(override_names)}}))
         return 0
     if args.state is None or args.parent_pid is None:

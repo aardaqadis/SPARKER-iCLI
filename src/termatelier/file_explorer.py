@@ -22,7 +22,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, DataTable, Input, Label, Select, Static
 
-from .config import RuntimeConfig
+from .config import RuntimeConfig, pictures_directory
 from .dialogs import Form
 from .storage import default_export_directory, load_project, project_roots, validate_export_directory
 
@@ -79,12 +79,13 @@ def nearest_directory(path):
 
 def folder_name(value):
     name = str(value).strip()
-    if not name or name in (".", "..") or any(character in name for character in '/\\<>:"|?*'):
-        raise ValueError("Enter one folder name, without a path or reserved characters.")
-    if name.endswith((".", " ")) or any(ord(character) < 32 for character in name):
-        raise ValueError("The folder name cannot end in a dot or contain control characters.")
-    if re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", name):
-        raise ValueError("That folder name is reserved by Windows.")
+    if not name or name in (".", "..") or "/" in name or any(ord(character) < 32 for character in name):
+        raise ValueError("Enter one folder name, without a path or control characters.")
+    if os.name == "nt":
+        if any(character in name for character in '\\<>:"|?*') or name.endswith((".", " ")):
+            raise ValueError("The folder name contains characters reserved by Windows.")
+        if re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", name):
+            raise ValueError("That folder name is reserved by Windows.")
     if len(name) > 128:
         raise ValueError("Use a folder name of at most 128 characters.")
     return name
@@ -262,7 +263,9 @@ class FileExplorer(ModalScreen):
         self.initial_filename = filename
         self.history = [self.current_directory]
         self.history_index = 0
-        self.places = {"Home": Path.home(), "Pictures": Path.home() / "Pictures", "Project": self.project_dir}
+        # The OS default is independent of a user-selected export folder.
+        pictures = pictures_directory()
+        self.places = {"Home": Path.home(), "Pictures": pictures, "Project": self.project_dir}
         try:
             self.places["Exports"] = default_export_directory(config)
         except ValueError:
@@ -272,6 +275,15 @@ class FileExplorer(ModalScreen):
                 drive = Path(f"{letter}:\\")
                 if drive.exists():
                     self.places[f"{letter}: drive"] = drive
+        else:
+            self.places["Filesystem"] = Path("/")
+            # These are ordinary browsable roots; mounted media can be found
+            # here without querying mount tools or requiring platform packages.
+            for label, directory in (("Volumes", "/Volumes"), ("Media", "/media"),
+                                     ("User media", f"/run/media/{Path.home().name}"), ("Mounts", "/mnt")):
+                location = Path(directory)
+                if location.is_dir():
+                    self.places[label] = location
 
     def _extensions(self):
         return self.custom_extensions or EXTENSIONS[self.operation]

@@ -19,7 +19,8 @@ except ImportError:  # Direct-file loading during the stdlib-only bootstrap.
 _STARTED = time.monotonic()
 
 
-def _memory_bytes():
+def _memory_measurement():
+    """Return a byte count and its meaning; peak RSS is not current usage."""
     if os.name == "nt":
         try:
             import ctypes
@@ -39,17 +40,30 @@ def _memory_bytes():
             ctypes.windll.psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
             handle = ctypes.windll.kernel32.GetCurrentProcess()
             if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
-                return counters.WorkingSetSize
+                return counters.WorkingSetSize, "resident", "Windows working set"
         except (OSError, AttributeError, ImportError):
             pass
     else:
+        if sys.platform.startswith("linux"):
+            try:
+                # statm's second field is the resident set in pages. Unlike
+                # ru_maxrss this falls again after image caches are released.
+                pages = int(Path("/proc/self/statm").read_text(encoding="ascii").split()[1])
+                return pages * os.sysconf("SC_PAGE_SIZE"), "resident", "Linux /proc/self/statm"
+            except (OSError, ValueError, IndexError, AttributeError):
+                pass
         try:
             import resource
             peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            return peak if sys.platform == "darwin" else peak * 1024
-        except (ImportError, OSError):
+            return (peak if sys.platform == "darwin" else peak * 1024), "peak resident", "resource.ru_maxrss"
+        except (ImportError, OSError, AttributeError):
             pass
-    return None
+    return None, "unavailable", "unavailable"
+
+
+def _memory_bytes():
+    """Compatibility accessor for callers needing only the byte count."""
+    return _memory_measurement()[0]
 
 
 def _version():
@@ -69,9 +83,7 @@ def _version():
                 return "unknown"
 
 
-def _venv_details(root):
-    location = root / ".venv"
-    config = location / "pyvenv.cfg"
+def _read_venv_config(config):
     values = {}
     try:
         for line in config.read_text(encoding="utf-8").splitlines():
@@ -80,13 +92,27 @@ def _venv_details(root):
                 values[name.strip()] = value.strip()
     except (OSError, UnicodeError):
         pass
+    return values
+
+
+def _venv_details(root):
+    location = root / ".venv"
+    config = location / "pyvenv.cfg"
+    active = sys.prefix != sys.base_prefix
+    active_path = Path(sys.prefix).resolve() if active else None
     return {"path": str(location), "exists": location.is_dir(), "config_path": str(config),
-            "config_exists": config.is_file(), "config": values,
-            "active": sys.prefix != sys.base_prefix,
+            "config_exists": config.is_file(), "config": _read_venv_config(config),
+            "active": active, "active_path": str(active_path) if active_path else None,
+            "active_config": _read_venv_config(active_path / "pyvenv.cfg") if active_path else {},
             "prefix": sys.prefix, "base_prefix": sys.base_prefix}
 
 
 def _history_cost(entries):
+    # Compressed snapshots store byte records rather than PIL images. Importing
+    # the model is appropriate only after a document has already been created.
+    from .model import Document
+    if hasattr(Document, "_snapshot_bytes"):
+        return sum(Document._snapshot_bytes(state) for _, state in entries)
     total = 0
     for _, state in entries:
         size, layers, _, selection, *_ = state
@@ -104,10 +130,13 @@ def collect_diagnostics(document=None, config=None, program_root=None):
             dependencies[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             dependencies[package] = "not installed"
+    memory_bytes, memory_kind, memory_source = _memory_measurement()
     data = {
         "program": {"name": "SPARKER iCLI", "version": _version(), "root": str(root),
                     "working_directory": str(Path.cwd()), "pid": os.getpid(),
-                    "memory_bytes": _memory_bytes(), "uptime_seconds": round(time.monotonic() - _STARTED, 3)},
+                    "memory_bytes": memory_bytes, "memory_kind": memory_kind, "memory_source": memory_source,
+                    "memory_mode": cfg.get("memory.mode", "standard"),
+                    "uptime_seconds": round(time.monotonic() - _STARTED, 3)},
         "python": {"executable": sys.executable, "version": platform.python_version(),
                    "implementation": platform.python_implementation(), "architecture": platform.machine()},
         "venv": _venv_details(root),
@@ -135,7 +164,8 @@ def collect_diagnostics(document=None, config=None, program_root=None):
             "active_name": document.layer.name, "dirty": document.dirty,
             "revision": document.revision, "selection": document.selection is not None,
             "undo_steps": len(document.undo_stack), "redo_steps": len(document.redo_stack),
-            "history_bytes": _history_cost(document.undo_stack + document.redo_stack),
+            "history_bytes": (document.history_memory_bytes if hasattr(document, "history_memory_bytes")
+                              else _history_cost(document.undo_stack + document.redo_stack)),
             "history_limit_steps": document.history_limit, "history_limit_bytes": document.history_bytes,
         }
     return data
@@ -190,7 +220,10 @@ def format_diagnostics(data):
              f"Terminal: {data['terminal']['columns']}×{data['terminal']['rows']} · stdout TTY={data['terminal']['stdout_tty']}",
              "Dependencies: " + ", ".join(f"{name}={version}" for name, version in data["dependencies"].items())]
     if program["memory_bytes"] is not None:
-        lines.append(f"Process memory: {program['memory_bytes'] / 1048576:.1f} MiB")
+        lines.append(f"Process memory ({program.get('memory_kind', 'resident')}): "
+                     f"{program['memory_bytes'] / 1048576:.1f} MiB · mode={program.get('memory_mode', 'standard')}")
+    if venv.get("active_path"):
+        lines.append(f"Active virtual environment: {venv['active_path']}")
     if "document" in data:
         doc = data["document"]
         lines += [f"Canvas: {doc['width']}×{doc['height']} RGBA · {doc['layers']} layers · active {doc['active_layer']}: {doc['active_name']}",

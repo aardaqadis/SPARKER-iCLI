@@ -12,9 +12,16 @@ import pytest
 
 from termatelier.config import RuntimeConfig
 from termatelier.model import Document
-from termatelier.preview import PreviewController, atomic_json
+from termatelier.preview import PreviewController, atomic_json, desktop_available
 from termatelier.preview_window import checkerboard, read_snapshot
 from termatelier.startup import parent_alive
+
+
+@pytest.fixture(autouse=True)
+def mocked_desktop_for_controller_tests(monkeypatch):
+    # IPC tests use a fake window process; real window tests retain their own
+    # desktop-availability skip conditions below.
+    monkeypatch.setattr("termatelier.preview.desktop_available", lambda: True)
 
 
 class FakeProcess:
@@ -62,7 +69,7 @@ def window_state(path):
 
 
 def native_available():
-    return os.name == "nt" or bool(os.environ.get("DISPLAY"))
+    return desktop_available()
 
 
 def test_preview_preserves_full_rgba_and_uses_external_disposable_files(tmp_path, monkeypatch):

@@ -345,6 +345,7 @@ def test_interactive_cli_runs_fullscreen_app(monkeypatch):
     import termatelier.__main__ as entry
     import termatelier.cli_app as workspace
     calls = []
+    monkeypatch.setenv("TERM", "xterm-256color")
 
     class Terminal(io.StringIO):
         def isatty(self):

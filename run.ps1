@@ -16,6 +16,7 @@ $TaskPreviousOverrides = $env:SPARKER_CONFIG_OVERRIDES
 $TaskExitCode = 1
 $TaskNoSplash = @($AppArgs | Where-Object { $_ -eq '--no-splash' }).Count -gt 0
 $TaskNoDebug = @($AppArgs | Where-Object { $_ -eq '--no-debug' }).Count -gt 0
+$TaskLowMemory = @($AppArgs | Where-Object { $_ -eq '--low-memory' }).Count -gt 0
 $TaskLaunchArgs = @($AppArgs | Where-Object { $_ -ne '--no-splash' })
 $TaskSettingsArgs = @()
 for ($TaskArgumentIndex = 0; $TaskArgumentIndex -lt $AppArgs.Count; $TaskArgumentIndex++) {
@@ -29,6 +30,9 @@ for ($TaskArgumentIndex = 0; $TaskArgumentIndex -lt $AppArgs.Count; $TaskArgumen
 }
 if (@($AppArgs | Where-Object { $_ -eq '--debug' }).Count -gt 0) {
     $TaskSettingsArgs += @('--set', 'debug.enabled=true')
+}
+if ($TaskLowMemory) {
+    $TaskSettingsArgs += @('--set', 'memory.mode=low')
 }
 $TaskMinimumSeconds = 2.5
 $TaskStartupClock = $null
@@ -103,29 +107,40 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Invalid startup settings. See the setting error above.' }
         $TaskConfiguration = ($TaskConfiguration | Select-Object -Last 1) | ConvertFrom-Json
         $TaskMinimumSeconds = [double]$TaskConfiguration.minimum_seconds
+        $TaskLowMemory = $TaskLowMemory -or $TaskConfiguration.memory_mode -eq 'low'
+        if ($TaskLowMemory) {
+            # Low-memory mode keeps no resident splash/debug Python process.
+            $TaskNoSplash = $true
+            $TaskNoDebug = $true
+        }
         if ($TaskSettingsArgs.Count -gt 0) {
             $env:SPARKER_CONFIG_OVERRIDES = $TaskConfiguration.overrides | ConvertTo-Json -Depth 10 -Compress
         }
-        try {
-            $TaskStateDirectory = Join-Path $TaskRoot 'work\startup'
-            New-Item -ItemType Directory -Path $TaskStateDirectory -Force | Out-Null
-            $TaskStatePath = Join-Path $TaskStateDirectory ('startup-' + [guid]::NewGuid().ToString('N') + '.json')
-            $TaskDebugPath = Join-Path $TaskStateDirectory ('runtime-' + [guid]::NewGuid().ToString('N') + '.json')
-            Set-TaskStartupPhase 'starting' 'Starting'
-            $env:SPARKER_STARTUP_STATE = $TaskStatePath
-            $env:SPARKER_DEBUG_STATE = $TaskDebugPath
-            $TaskPythonWindowless = Join-Path (Split-Path -Parent $TaskSystemPython) 'pythonw.exe'
-            $TaskSplashPython = $TaskSystemPython
-            if (Test-Path -LiteralPath $TaskPythonWindowless) { $TaskSplashPython = $TaskPythonWindowless }
-            $TaskHelperArgs = @($TaskStartupHelper, '--state', $TaskStatePath, '--parent-pid', [string]$PID,
-                                '--logo', $TaskLogo, '--debug-state', $TaskDebugPath) + $TaskSettingsArgs
-            if ($TaskNoSplash -or -not (Test-Path -LiteralPath $TaskLogo)) { $TaskHelperArgs += '--no-splash' }
-            if ($TaskNoDebug) { $TaskHelperArgs += '--no-debug' }
-            $TaskHelperCommandLine = ($TaskHelperArgs | ForEach-Object { ConvertTo-TaskQuotedArgument $_ }) -join ' '
-            $TaskSplashProcess = Start-Process -FilePath $TaskSplashPython -ArgumentList $TaskHelperCommandLine -WindowStyle Hidden -PassThru
-            $TaskStartupClock = [System.Diagnostics.Stopwatch]::StartNew()
-        } catch {
-            Write-Verbose "Startup window unavailable: $($_.Exception.Message)"
+        if (-not $TaskLowMemory) {
+            try {
+                $TaskStateDirectory = Join-Path $TaskRoot 'work\startup'
+                New-Item -ItemType Directory -Path $TaskStateDirectory -Force | Out-Null
+                $TaskStatePath = Join-Path $TaskStateDirectory ('startup-' + [guid]::NewGuid().ToString('N') + '.json')
+                $TaskDebugPath = Join-Path $TaskStateDirectory ('runtime-' + [guid]::NewGuid().ToString('N') + '.json')
+                Set-TaskStartupPhase 'starting' 'Starting'
+                $env:SPARKER_STARTUP_STATE = $TaskStatePath
+                $env:SPARKER_DEBUG_STATE = $TaskDebugPath
+                $TaskPythonWindowless = Join-Path (Split-Path -Parent $TaskSystemPython) 'pythonw.exe'
+                $TaskSplashPython = $TaskSystemPython
+                if (Test-Path -LiteralPath $TaskPythonWindowless) { $TaskSplashPython = $TaskPythonWindowless }
+                $TaskHelperArgs = @($TaskStartupHelper, '--state', $TaskStatePath, '--parent-pid', [string]$PID,
+                                    '--logo', $TaskLogo, '--debug-state', $TaskDebugPath) + $TaskSettingsArgs
+                if ($TaskNoSplash -or -not (Test-Path -LiteralPath $TaskLogo)) { $TaskHelperArgs += '--no-splash' }
+                if ($TaskNoDebug) { $TaskHelperArgs += '--no-debug' }
+                $TaskHelperCommandLine = ($TaskHelperArgs | ForEach-Object { ConvertTo-TaskQuotedArgument $_ }) -join ' '
+                $TaskSplashProcess = Start-Process -FilePath $TaskSplashPython -ArgumentList $TaskHelperCommandLine -WindowStyle Hidden -PassThru
+                $TaskStartupClock = [System.Diagnostics.Stopwatch]::StartNew()
+            } catch {
+                Write-Verbose "Startup window unavailable: $($_.Exception.Message)"
+            }
+        } else {
+            Remove-Item Env:SPARKER_STARTUP_STATE -ErrorAction SilentlyContinue
+            Remove-Item Env:SPARKER_DEBUG_STATE -ErrorAction SilentlyContinue
         }
     } else {
         Remove-Item Env:SPARKER_STARTUP_STATE -ErrorAction SilentlyContinue

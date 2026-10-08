@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 
 
@@ -18,19 +19,55 @@ def project_root():
     return Path(os.environ.get("SPARKER_PROJECT_ROOT", Path(__file__).resolve().parents[2])).resolve()
 
 
+def pictures_directory():
+    """Respect an XDG Pictures location without evaluating shell expressions."""
+    fallback = Path.home() / "Pictures"
+    if os.name != "nt" and sys.platform != "darwin":
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        if not base.is_absolute():
+            base = Path.home() / ".config"
+        source = base / "user-dirs.dirs"
+        try:
+            if source.stat().st_size <= 65536:
+                for line in source.read_text(encoding="utf-8").splitlines():
+                    if line.strip().startswith("XDG_PICTURES_DIR="):
+                        value = json.loads(line.strip().partition("=")[2].strip())
+                        if not isinstance(value, str):
+                            break
+                        if value == "$HOME" or value.startswith("$HOME/"):
+                            value = str(Path.home()) + value[5:]
+                        candidate = Path(value)
+                        if candidate.is_absolute():
+                            return candidate.resolve()
+        except (OSError, ValueError, TypeError):
+            pass
+    return fallback.resolve()
+
+
 def default_export_directory():
-    return (Path.home() / "Pictures" / "SPARKER-iCLI" / "Exports").resolve()
+    return (pictures_directory() / "SPARKER-iCLI" / "Exports").resolve()
 
 
 def settings_path():
     override = os.environ.get("SPARKER_CONFIG_FILE")
     if override:
         return Path(override).expanduser().resolve()
-    base = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".config"))
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+        legacy = Path.home() / ".config" / "SPARKER-iCLI" / "settings.json"
+        if legacy.exists() and not (base / "SPARKER-iCLI" / "settings.json").exists():
+            return legacy.resolve()
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        if not base.is_absolute():
+            base = Path.home() / ".config"
     return (base / "SPARKER-iCLI" / "settings.json").resolve()
 
 
 DEFAULTS = {
+    "memory.mode": "standard",
     "debug.enabled": True,
     "debug.refresh_ms": 500,
     "debug.font_size": 11,
@@ -46,6 +83,7 @@ DEFAULTS = {
     "view.zoom_max": 32.0,
     "history.max_steps": 40,
     "history.max_mb": 96,
+    "history.storage": "raw",
     "brush.size": 3,
     "brush.hardness": 0.8,
     "brush.opacity": 1.0,
@@ -65,6 +103,7 @@ DEFAULTS = {
 
 # Type, allowed range/choices and a user-facing description.
 SPECS = {
+    "memory.mode": ("choice", ("standard", "low"), "Low uses compressed undo (8 steps / 16 MiB maximum) and disables desktop helpers"),
     "debug.enabled": ("bool", None, "Show the transparent desktop debug overlay"),
     "debug.refresh_ms": ("int", (100, 10000), "Debug refresh interval in milliseconds"),
     "debug.font_size": ("int", (7, 32), "Debug text size in points"),
@@ -80,6 +119,7 @@ SPECS = {
     "view.zoom_max": ("float", (1, 128), "Maximum preview zoom"),
     "history.max_steps": ("int", (1, 200), "Maximum undo and redo checkpoints combined"),
     "history.max_mb": ("int", (8, 512), "Undo and redo snapshot memory budget in MiB"),
+    "history.storage": ("choice", ("raw", "compressed"), "Lossless undo storage; compression uses less memory with additional CPU work"),
     "brush.size": ("int", (1, 128), "Default brush diameter in pixels"),
     "brush.hardness": ("float", (0, 1), "Default brush hardness"),
     "brush.opacity": ("float", (0, 1), "Default drawing opacity"),
@@ -196,10 +236,20 @@ class RuntimeConfig:
         return cls(values, path=destination, overrides=effective_overrides, warnings=warnings)
 
     def get(self, name, default=None):
-        return self._overrides.get(name, self._values.get(name, default))
+        value = self._overrides.get(name, self._values.get(name, default))
+        mode = self._overrides.get("memory.mode", self._values.get("memory.mode", "standard"))
+        if mode == "low":
+            if name in ("debug.enabled", "preview.enabled"):
+                return False
+            if name == "history.storage":
+                return "compressed"
+            limits = {"history.max_steps": 8, "history.max_mb": 16}
+            if name in limits:
+                return min(value, limits[name])
+        return value
 
     def as_dict(self):
-        return {**self._values, **self._overrides}
+        return {name: self.get(name) for name in dict.fromkeys([*self._values, *self._overrides])}
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)

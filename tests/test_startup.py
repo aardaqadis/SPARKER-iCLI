@@ -148,6 +148,7 @@ def test_launcher_settings_validate_before_environment_install(tmp_path, monkeyp
                             check=True, capture_output=True, text=True, timeout=10)
     checked = json.loads(result.stdout)
     assert checked == {"minimum_seconds": 4.5, "debug_enabled": False,
+                        "memory_mode": "standard",
                         "overrides": {"startup.minimum_seconds": 4.5, "debug.enabled": False}}
     assert not (tmp_path / "settings.json").exists()
 
@@ -277,6 +278,34 @@ def test_native_helper_logo_closes_but_debug_persists_and_toggles(tmp_path, monk
         wait_until(lambda: windows().get("SPARKER iCLI debug", (False,))[0])
         startup.write_state(state, "closed", "Closed")
         assert process.wait(timeout=5) == 0
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        process.stderr.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Native helper lifecycle requires Windows")
+def test_native_helper_exits_when_running_session_switches_to_low_memory(tmp_path, monkeypatch):
+    from termatelier.config import RuntimeConfig
+    from termatelier.diagnostics import collect_diagnostics
+
+    monkeypatch.setenv("SPARKER_CONFIG_FILE", str(tmp_path / "settings.json"))
+    state = tmp_path / "startup.json"
+    debug = tmp_path / "runtime.json"
+    startup.write_state(state, "ready", "Ready")
+    config = RuntimeConfig.load()
+    debug.write_text(json.dumps({"diagnostics": collect_diagnostics(config=config)}), encoding="utf-8")
+    process = subprocess.Popen([sys._base_executable, "-S", *startup.helper_arguments(state, os.getpid()),
+                                "--no-splash", "--debug-state", str(debug)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        time.sleep(.6)
+        assert process.poll() is None
+        config.set("memory.mode", "low", persist=False)
+        debug.write_text(json.dumps({"diagnostics": collect_diagnostics(config=config)}), encoding="utf-8")
+        assert process.wait(timeout=5) == 0, process.stderr.read()
+        assert startup.read_state(state)["phase"] == "ready"
     finally:
         if process.poll() is None:
             process.terminate()

@@ -41,7 +41,8 @@ def run_check(dist):
             "'license':m.metadata('sparker-icli')['License-Expression']}))"]))
         assert Path(details["file"]).is_relative_to(site), details
         assert details["version"] == version and details["license"] == "MIT", details
-        assert "SPARKER" in execute(["-m", "sparkericli", "--help"])
+        help_text = execute(["-m", "sparkericli", "--help"])
+        assert "SPARKER" in help_text and "--low-memory" in help_text
         execute(["-m", "sparkericli", "--new", "31x19", "--no-debug", "-c",
                  "pencil 2,3 --color orange", "--export", "native.png"])
         execute(["-c", "from PIL import Image; "
@@ -51,7 +52,17 @@ def run_check(dist):
             "assert p.size==(31,19); assert p.convert('RGBA').tobytes()==d.composite().tobytes()"])
         tools = json.loads(execute(["-m", "sparkericli", "-c", "tools count --json"]))
         assert tools["total"] == 1248, tools
-    print(f"Installed {version} wheel passed: module/metadata, help, 1,248 tools, exact 31x19 PNG.")
+        low = json.loads(execute(["-m", "sparkericli", "--low-memory", "-c", "config list --json"]))
+        assert low["memory.mode"] == "low" and low["history.storage"] == "compressed"
+        assert low["history.max_mb"] == 16 and low["history.max_steps"] == 8
+        assert not low["preview.enabled"] and not low["debug.enabled"]
+        execute(["-m", "sparkericli", "--new", "31x19", "--low-memory", "-c",
+                 "pencil 2,3 --color orange", "--export", "low.png", "--save-project", "low.tart"])
+        execute(["-c", "from PIL import Image; from termatelier.storage import load_project; "
+            "a=Image.open('exports/native.png').convert('RGBA'); b=Image.open('exports/low.png').convert('RGBA'); "
+            "assert a.size==b.size==(31,19); assert a.tobytes()==b.tobytes(); "
+            "assert load_project('low.tart').composite().tobytes()==a.tobytes()"])
+    print(f"Installed {version} wheel passed: module/metadata, help, 1,248 tools, low-memory profile, exact PNG/project pixels.")
 
 
 if __name__ == "__main__":

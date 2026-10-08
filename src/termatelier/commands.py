@@ -223,6 +223,7 @@ class CommandSession:
         doc = self.document
         doc.history_limit = self.config.get("history.max_steps")
         doc.history_bytes = self.config.get("history.max_mb") * 1024 * 1024
+        doc.history_storage = self.config.get("history.storage")
         doc._trim()
         mappings = {"brush.size": "brush_size", "brush.hardness": "hardness",
                     "brush.opacity": "opacity", "fill.tolerance": "tolerance",
@@ -288,7 +289,9 @@ class CommandSession:
             _count(args, 2)
             value = self.config.set(args[0], args[1])
             self._apply_document_config(args[0])
-            return CommandResult(f"{args[0]} = {json.dumps(value)}\nSaved preferences: {self.config.path}", changed=True)
+            effective = self.config.get(args[0])
+            detail = f" (saved {json.dumps(value)}; limited by low-memory mode)" if effective != value else ""
+            return CommandResult(f"{args[0]} = {json.dumps(effective)}{detail}\nSaved preferences: {self.config.path}", changed=True)
         if action == "reset":
             _count(args, 0, 1)
             name = args[0] if args and args[0].lower() != "all" else None
@@ -316,6 +319,8 @@ class CommandSession:
             _count(remaining, 0)
             enabled = not self.config.get("debug.enabled") if action == "toggle" else action == "on"
             self.config.set("debug.enabled", enabled)
+            if enabled and self.config.get("memory.mode") == "low":
+                return CommandResult("Debug preference saved; the overlay stays off in low-memory mode. Use config set memory.mode standard and relaunch to show it.", changed=True)
             return CommandResult(f"Debug overlay {'enabled' if enabled else 'hidden'}.", changed=True)
         if action == "info":
             args, opts = _args(remaining, flags=("json",))

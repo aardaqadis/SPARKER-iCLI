@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from PIL import Image
@@ -223,10 +224,23 @@ async def test_new_folder_explicit_creation_validation_and_address(tmp_path):
         assert "does not exist" in error_text(explorer)
 
 
-@pytest.mark.parametrize("name", ["", ".", "..", "a/b", "a\\b", "CON", "lpt1.txt", "trail.", "x\x00"])
+@pytest.mark.parametrize("name", ["", ".", "..", "a/b", "x\x00"])
 def test_folder_name_rejects_traversal_and_reserved_names(name):
     with pytest.raises(ValueError):
         folder_name(name)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows filename restrictions")
+@pytest.mark.parametrize("name", ["a\\b", "CON", "lpt1.txt", "trail."])
+def test_folder_name_rejects_windows_names(name):
+    with pytest.raises(ValueError):
+        folder_name(name)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Valid Unix filenames")
+@pytest.mark.parametrize("name", ["a\\b", "CON", "lpt1.txt", "trail.", "art:layers"])
+def test_folder_name_accepts_unix_names(name):
+    assert folder_name(name) == name
 
 
 @pytest.mark.asyncio

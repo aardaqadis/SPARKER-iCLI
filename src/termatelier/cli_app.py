@@ -213,6 +213,9 @@ class CLIWorkspaceScreen(Screen):
             text = "Preview unavailable · F5 to retry"
         if self.preview is None and self.app.is_headless:
             text = "Preview omitted in headless mode"
+        if not self.session.config.get("preview.enabled"):
+            text = ("Preview disabled in low-memory mode" if self.session.config.get("memory.mode") == "low"
+                    else "Preview disabled in settings")
         if text != self._preview_label:
             self.query_one("#cli-preview-status", Static).update(Text(text))
             self._preview_label = text

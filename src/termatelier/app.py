@@ -203,6 +203,7 @@ class Studio(App):
     def apply_runtime_settings(self):
         self.doc.history_limit = self.config.get("history.max_steps")
         self.doc.history_bytes = self.config.get("history.max_mb") * 1024 * 1024
+        self.doc.history_storage = self.config.get("history.storage")
         self.doc._trim()
 
     def publish_debug(self, force=False):
