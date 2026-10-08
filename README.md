@@ -4,12 +4,7 @@
 
 Ever had the need to have MS paint in your command prompt? No? Download it anyway!
 
-SPARKER iCLI is a minimalist terminal image editor for mouse painting and digital
-pixel art, with a full-screen command workspace and **1,248 procedural art recipes
-and effects**. Paint interactively or use repeatable commands and scripts against
-the same layered RGBA document.
-
-![The terminal painting studio](preview.png)
+SPARKER iCLI is a raster canvas editor inside of any command line interface. Consuming less memory than Microsoft paint, it offers an optimised way of digitally producing art.
 
 ## Run on Windows
 
@@ -59,7 +54,6 @@ folder. Display zoom and terminal character resolution do not resize saved image
 - [Native project format](FORMAT.md)
 - [Verification](TESTING.md) and [performance measurements](PERFORMANCE.md)
 - [Contributing and local checks](CONTRIBUTING.md)
-- [Creating your GitHub repository](PUBLISHING.md)
 - [Changes](CHANGELOG.md)
 
 Application code lives in **src/** and tests in **tests/**. The internal
