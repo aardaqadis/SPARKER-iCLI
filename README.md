@@ -10,7 +10,6 @@ filters, undo/redo and **1,248 art tools**. Use the canvas or editing commands.
 ## Start
 =======
 SPARKER iCLI is a raster canvas editor inside of any command line interface. Consuming less memory than Microsoft paint, it offers an optimised way of digitally producing art.
->>>>>>> 086c2798747f0a50eb21600ba4f25ec6385fa090
 
 Install **Python 3.11+**, then run from this folder:
 
