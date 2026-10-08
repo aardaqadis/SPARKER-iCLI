@@ -11,6 +11,7 @@ from collections import Counter
 from dataclasses import dataclass
 import json
 import math
+import re
 from pathlib import Path
 import shlex
 import time
@@ -18,9 +19,17 @@ import time
 from PIL import Image, ImageChops, ImageColor, ImageFilter, ImageOps
 
 from .model import BLENDS, Document, Layer, valid_size
-from .storage import export, import_document, load_project, open_image, save_project, resolve_export_path
+from .storage import export, export_dimensions, import_document, load_project, open_image, save_project, resolve_export_path
 from .config import RuntimeConfig, SPECS
 from .diagnostics import publish_diagnostics, format_diagnostics
+from .clipboard_commands import HELP as CLIPBOARD_HELP, execute_clipboard
+from .text_commands import HELP as TEXT_HELP, execute_text, execute_fonts
+from .editing_commands import HELP as EDITING_HELP, execute_extra
+from .document_tools import HELP as DOCUMENT_HELP, execute_document
+from .geometry_commands import HELP as GEOMETRY_HELP, execute_geometry
+from .painting_commands import HELP as PAINTING_HELP, execute_painting
+from .ai_commands import HELP as AI_HELP, execute_ai
+from .native_options import HELP as NATIVE_HELP, execute_native
 
 
 class CommandError(ValueError):
@@ -44,7 +53,8 @@ HELP = {
     "new": "new WIDTHxHEIGHT [--transparent | --color COLOR]",
     "open": "open PATH — replace the document with a .tart project or image",
     "save": "save [PATH.tart] — preserve layers, selection, palette and metadata",
-    "export": "export [PATH] [--columns N] [--allow-lossy] — external export folder; PNG/WebP/TIFF preserve RGBA pixels",
+    "export": "export [PATH] [--scale 1..16] [--columns N] [--allow-lossy] — crisp NxN pixel enlargement, default 1; lossless PNG/WebP/TIFF; external folder, up to 16,777,216 image pixels",
+    "commands": "commands [QUERY] [--json] — search command names and descriptions",
     "files": "files [open|import|save|export|script|debug|font|directory] [START_PATH] — F6 file explorer in the painter/full-screen CLI; use explicit paths in batch or --repl",
     "config": "config list [PREFIX] [--json] | get NAME | set NAME VALUE | reset [NAME|all] | path — validated, persistent preferences",
     "debug": "debug [info] [--json] | on | off | toggle | settings [--json] | set NAME VALUE | export [PATH.json] — transparent overlay and diagnostics",
@@ -88,9 +98,70 @@ HELP = {
     "script": "script PATH [--nonatomic] — run commands relative to the script's folder; stop and report the first failing line",
     "quit": "quit — leave the REPL or request exit from the editor",
 }
+HELP.update(CLIPBOARD_HELP)
+HELP.update(TEXT_HELP)
+HELP.update(EDITING_HELP)
+HELP.update(DOCUMENT_HELP)
+HELP.update(GEOMETRY_HELP)
+HELP.update(PAINTING_HELP)
+HELP.update(AI_HELP)
+HELP.update(NATIVE_HELP)
+
+SUBCOMMANDS = {
+    "clipboard": ("info", "clear", "load", "save"), "text": ("measure", "fonts"),
+    "fonts": ("list", "info"), "selection": ("bounds", "grow", "shrink", "border", "threshold"),
+    "align": ("left", "center-x", "right", "top", "center-y", "bottom", "center"),
+    "adjust": ("gamma", "levels", "temperature", "alpha"),
+    "layer": ("list", "add", "select", "rename", "duplicate", "delete", "raise", "lower",
+              "reorder", "merge", "flatten", "opacity", "blend", "show", "hide", "lock", "unlock", "mask"),
+    "select": ("all", "none", "invert", "rectangle", "ellipse", "lasso", "wand", "feather"),
+    "config": ("list", "get", "set", "reset", "path"),
+    "debug": ("info", "on", "off", "toggle", "settings", "set", "export"),
+    "path": ("list", "new", "curve", "point", "close", "delete", "stroke", "fill", "select", "move"),
+    "channel": ("list", "save", "load", "mask", "delete"),
+    "fx": ("list", "add", "edit", "show", "hide", "remove", "reorder", "bake"),
+    "mcp": ("settings", "list", "add", "remove", "tools", "call"),
+    "ai": ("settings", "tools", "mappings", "map", "unmap", "background-remove", "upscale", "denoise", "inpaint", "generate", "restore", "colorize", "call"),
+    "geometry": ("translate", "scale", "rotate", "shear", "perspective", "3d", "unified", "handles", "cage", "warp"),
+    "tone": ("curves", "exposure", "shadows-highlights", "hue-saturation", "color-balance", "colorize", "desaturate", "levels"),
+    "retouch": ("blur", "sharpen", "dodge", "burn"),
+    "distribute": ("horizontal", "vertical", "horizontal-gap", "vertical-gap"),
+}
+
+
+def syntax_completions(value):
+    """Complete subcommands and named options without changing command data."""
+    value = value.lstrip()
+    stem, separator, prefix = value.rpartition(" ")
+    if not separator:
+        return None
+    try:
+        words = tokenize(stem)
+    except CommandError:
+        return None
+    if not words or words[0] not in HELP:
+        return None
+    command = words[0]
+    choices = ()
+    if prefix.startswith("--"):
+        used = {word.partition("=")[0] for word in words[1:] if word.startswith("--")}
+        choices = sorted(set(re.findall(r"--[a-z][a-z-]*", HELP[command])) - used)
+    elif len(words) == 1:
+        choices = sorted(HELP) if command == "help" else SUBCOMMANDS.get(command, ())
+    elif words[-1] == "--align" and command == "text":
+        choices = ("left", "center", "right")
+    elif words[-1] == "--anchor" and command == "text":
+        from .text_tools import ANCHORS
+        choices = tuple(ANCHORS)
+    elif command == "layer" and len(words) == 2 and words[-1] == "blend":
+        choices = BLENDS
+    return [stem + " " + choice for choice in choices if choice.startswith(prefix)] if choices else None
 
 TOOLS = {"brush", "pencil", "eraser", "fill", "gradient", "text", "line", "rectangle", "ellipse",
          "select_rect", "select_ellipse", "lasso", "wand", "picker", "move", "hand"}
+from .painting_tools import MOUSE_TOOLS
+TOOLS.update(MOUSE_TOOLS)
+TOOLS.update(("select_color", "scissors", "foreground"))
 FILTERS = {"invert", "grayscale", "sepia", "blur", "sharpen", "edges", "emboss", "posterize",
            "threshold", "brightness", "contrast", "saturation", "autocontrast"}
 DEFAULTS = {"foreground": "#e79335", "background": "#ffffff", "brush_size": 3,
@@ -224,6 +295,10 @@ class CommandSession:
         doc.history_limit = self.config.get("history.max_steps")
         doc.history_bytes = self.config.get("history.max_mb") * 1024 * 1024
         doc.history_storage = self.config.get("history.storage")
+        doc.cache_effects = self.config.get("memory.mode") != "low"
+        for layer in doc.layers:
+            layer.cache_effects = self.config.get("memory.mode") != "low"
+            layer.invalidate_effects()
         doc._trim()
         mappings = {"brush.size": "brush_size", "brush.hardness": "hardness",
                     "brush.opacity": "opacity", "fill.tolerance": "tolerance",
@@ -432,7 +507,32 @@ class CommandSession:
         return CommandResult("\n".join(lines))
 
     def _execute(self, command, tokens):
+        if command in NATIVE_HELP:
+            return execute_native(self, command, tokens)
         doc = self.document
+        if command in DOCUMENT_HELP:
+            return execute_document(self, command, tokens)
+        if command in GEOMETRY_HELP:
+            return execute_geometry(self, command, tokens)
+        if command in PAINTING_HELP:
+            return execute_painting(self, command, tokens)
+        if command in AI_HELP:
+            return execute_ai(self, command, tokens)
+        if command in CLIPBOARD_HELP:
+            return execute_clipboard(self, command, tokens)
+        if command == "text":
+            return execute_text(self, tokens)
+        if command == "fonts":
+            return execute_fonts(self, tokens)
+        if command in EDITING_HELP:
+            return execute_extra(self, command, tokens)
+        if command == "commands":
+            args, opts = _args(tokens, flags=("json",))
+            query = " ".join(args).casefold()
+            matches = {name: description for name, description in sorted(HELP.items())
+                       if query in name.casefold() or query in description.casefold()}
+            return CommandResult(json.dumps(matches, ensure_ascii=False, indent=2) if opts.get("json") else
+                                 "\n".join(matches.values()) or "No matching commands.")
         if command == "help":
             _count(tokens, 0, 1)
             if tokens:
@@ -467,6 +567,7 @@ class CommandSession:
                 replacement.active = 0
             elif "color" in opts:
                 replacement.layers[0].image = Image.new("RGBA", replacement.size, _color(opts["color"]))
+            replacement.clipboard = doc.clipboard
             self.document, self.project_path = replacement, None
             return CommandResult(f"New {replacement.width}×{replacement.height} canvas.", True, True)
         if command == "open":
@@ -475,6 +576,7 @@ class CommandSession:
             path = self._path(args[0])
             native = path.suffix.lower() == ".tart"
             replacement = load_project(path) if native else import_document(path)
+            replacement.clipboard = doc.clipboard
             self.document, self.project_path = replacement, path if native else None
             return CommandResult(f"Opened {path}.", True, True)
         if command == "save":
@@ -487,16 +589,23 @@ class CommandSession:
             self.project_path = path
             return CommandResult(f"Saved {path}.", changed=True)
         if command == "export":
-            args, opts = _args(tokens, ("columns",), ("allow-lossy",))
+            args, opts = _args(tokens, ("columns", "scale"), ("allow-lossy",))
             _count(args, 0, 1)
             columns = _integer(opts.get("columns", 100), 1, 500)
             requested = args[0] if args else None
             if requested and (requested.startswith("./") or requested.startswith(".\\") or requested.startswith("../") or requested.startswith("..\\")):
                 requested = self._path(requested)
-            path = export(doc, requested, columns, allow_lossy=bool(opts.get("allow-lossy")), config=self.config)
+            scale = _integer(opts["scale"], 1, 16) if "scale" in opts else None
+            path = export(doc, requested, columns, allow_lossy=bool(opts.get("allow-lossy")), config=self.config, scale=scale)
             suffix = Path(path).suffix.lower()
             note = " (lossy format; dimensions preserved)" if suffix in (".jpg", ".jpeg", ".gif", ".bmp") else ""
-            return CommandResult(f"Exported {path}{note}.")
+            dimensions = ""
+            if suffix not in (".txt", ".ansi"):
+                effective = 1 if suffix == ".ora" else self.config.get("export.scale") if scale is None else scale
+                width, height = export_dimensions(doc.size, effective,
+                                                  extension=suffix)
+                dimensions = f" · {width}×{height} pixels"
+            return CommandResult(f"Exported {path}{note}{dimensions}.")
         if command == "import":
             args, opts = _args(tokens, ("name", "x", "y"))
             _count(args, 1)
@@ -578,14 +687,6 @@ class CommandSession:
             width = _integer(opts.get("width", self.setting("brush_size")), 1, 128)
             mask = doc.shape_mask(command, tuple(points[:2]), tuple(points[2:]), width, bool(opts.get("filled")))
             return self._edit(command.capitalize(), lambda: doc.paint_mask(mask, color, opacity))
-        if command == "text":
-            args, opts = _args(tokens, ("color", "size", "font", "opacity"))
-            _count(args, 3)
-            point = tuple(map(_integer, args[:2]))
-            color, opacity = self._paint_options(opts)
-            size = _integer(opts.get("size", 12), 1, 512)
-            font = str(self._path(opts["font"])) if opts.get("font") else ""
-            return self._edit("Text", lambda: doc.text(point, args[2], color, size, font, opacity))
         if command == "pick":
             args, opts = _args(tokens, flags=("active",))
             _count(args, 2)
@@ -626,12 +727,6 @@ class CommandSession:
             if name in ranges: amount = _number(amount, *ranges[name])
             elif len(tokens) == 2: raise CommandError(f"{name} does not take an amount.")
             return self._edit(f"Filter {name}", lambda: doc.apply_filter(name, amount))
-        if command in ("copy", "cut", "paste"):
-            _count(tokens, 0)
-            if command == "copy":
-                doc.copy_selection()
-                return CommandResult("Copied selection.")
-            return self._edit(command.capitalize(), doc.paste if command == "paste" else lambda: doc.copy_selection(True))
         if command == "palette":
             return self._palette(tokens)
         if command == "guides":
@@ -655,7 +750,7 @@ class CommandSession:
             _count(tokens, 0, 2)
             if not tokens: return CommandResult(json.dumps(doc.metadata, ensure_ascii=False, indent=2))
             _count(tokens, 2)
-            if tokens[0] in ("guides_x", "guides_y", "grid_spacing"):
+            if tokens[0] in ("guides_x", "guides_y", "grid_spacing", "paths", "channels"):
                 raise CommandError("Use guides or grid to change this metadata.")
             return self._edit("Set metadata", lambda: doc.metadata.update({tokens[0]: tokens[1]}))
         if command in ("undo", "redo"):
@@ -838,6 +933,7 @@ class CommandSession:
                 return result
             doc.layer.image = centered(doc.layer.image)
             if doc.layer.mask is not None: doc.layer.mask = centered(doc.layer.mask)
+            doc.layer.text_recipe = None
         return self._edit(f"Transform {kind}", operation)
 
     def _palette(self, tokens):

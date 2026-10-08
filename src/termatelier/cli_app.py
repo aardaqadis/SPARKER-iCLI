@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import time
+import asyncio
 from typing import Callable
 
 from rich.text import Text
@@ -17,7 +18,7 @@ from textual.screen import Screen
 from textual.theme import Theme
 from textual.widgets import Footer, Input, RichLog, Static
 
-from .commands import CommandError, CommandResult, CommandSession, HELP, TOOLS as CLASSIC_TOOLS, tokenize
+from .commands import CommandError, CommandResult, CommandSession, HELP, TOOLS as CLASSIC_TOOLS, tokenize, syntax_completions
 from .dialogs import Confirm
 
 
@@ -28,7 +29,8 @@ FILES_HELP = (
     "Browse folders with the mouse or arrow keys and Enter; use the address field for a path.\n"
     "Choose a file, filter the list, create a folder, and use the filename field for new files.\n"
     "Save/export destinations are checked before writing; existing destinations ask before replacement.\n"
-    "Exports and debug JSON default to the external export folder. PNG, WebP and TIFF preserve RGBA pixels.\n"
+    "Exports and debug JSON use the external export folder. PNG/WebP/TIFF preserve every original canvas pixel and transparency.\n"
+    "Image Scale enlarges each canvas pixel into a crisp block; text exports use columns instead.\n"
     "Font selection prepares a text command for you to edit. Esc or Cancel closes without changes.\n"
     "files directory chooses the persistent external export folder.\n"
     "The explorer is available in the full-screen CLI. Piped CLI, scripts and --repl use path commands."
@@ -100,6 +102,9 @@ class CLIWorkspaceScreen(Screen):
         Binding("ctrl+z", "undo", "Undo", priority=True),
         Binding("ctrl+y", "redo", "Redo", priority=True),
         Binding("ctrl+l", "clear_log", "Clear output"),
+        Binding("alt+c", "copy_image", "Copy image", show=False, priority=True),
+        Binding("alt+x", "cut_image", "Cut image", show=False, priority=True),
+        Binding("alt+v", "paste_image", "Paste image", show=False, priority=True),
         Binding("pageup", "output_up", show=False),
         Binding("pagedown", "output_down", show=False),
         Binding("ctrl+q", "quit", "Quit"),
@@ -121,11 +126,13 @@ class CLIWorkspaceScreen(Screen):
         self._preview_closed = False
         self._preview_label = None
         self._diagnostics_last = 0.0
+        self.remote_busy = False
 
     def check_action(self, action, parameters):
         # Priority shortcuts must never edit the hidden workspace while a file
         # browser or confirmation owns input.
-        return self.app.screen is self
+        return self.app.screen is self and (not self.remote_busy or action in
+            ("output_up", "output_down", "clear_log"))
 
     @property
     def document(self):
@@ -174,6 +181,7 @@ class CLIWorkspaceScreen(Screen):
         self.publish_debug()
 
     def publish_debug(self, force=False):
+        if self.remote_busy: return
         # Studio owns its own telemetry publisher while the screen is embedded.
         if not isinstance(self.app, CLIApp) or not os.environ.get("SPARKER_DEBUG_STATE"):
             return
@@ -228,6 +236,7 @@ class CLIWorkspaceScreen(Screen):
         text = (f"{name}{' *' if doc.dirty else ''}  ·  {doc.width}×{doc.height} pixels  ·  "
                 f"{len(doc.layers)} layers  ·  active: {doc.layer.name}  ·  "
                 f"{len(doc.undo_stack)} undo / {len(doc.redo_stack)} redo")
+        if self.remote_busy: text += "  ·  MCP processing…"
         self.query_one("#cli-document-status", Static).update(Text(text))
         self.update_preview_status()
 
@@ -248,6 +257,8 @@ class CLIWorkspaceScreen(Screen):
             self.submit_command(line)
 
     def submit_command(self, line):
+        if self.remote_busy:
+            return
         line = line.strip()
         if not line:
             return
@@ -272,6 +283,35 @@ class CLIWorkspaceScreen(Screen):
 
     def execute_command(self, line):
         """Refresh shared state after success or edits retained by a failed script."""
+        if self.remote_busy:
+            return
+        try:
+            tokens = tokenize(line)
+            if tokens and tokens[0].lower() in ("ai", "mcp"):
+                family = tokens[0].lower()
+                operation = tokens[1].lower() if len(tokens) > 1 else "settings"
+                if operation == "settings":
+                    self.open_ai_settings()
+                    return
+                from .mcp_client import MCPRegistry, OPERATIONS
+                registry = MCPRegistry.load(self.session.config)
+                network = operation in ("tools", "call") or family == "ai" and operation in OPERATIONS
+                missing = family == "ai" and operation in OPERATIONS and operation not in registry.mappings and not any(token.partition("=")[0] == "--tool" for token in tokens)
+                if network and (not registry.servers or missing):
+                    self.write("Configure the MCP connection and map this AI operation, then run the command again.")
+                    self.open_ai_settings(line)
+                    return
+                if network:
+                    self.remote_busy = True
+                    self.query_one("#cli-command-line", CLIInput).disabled = True
+                    self.update_status()
+                    self.write("Contacting MCP service… painting edits are paused until the result arrives.")
+                    self.run_worker(self._remote_command(line), name="mcp-image", group="mcp-image", exclusive=True)
+                    return
+        except (CommandError, ValueError, OSError) as error:
+            self.write_error(error)
+            self._refocus()
+            return
         previous_document = self.document
         previous_state = self._state_signature()
         command_completed = False
@@ -306,7 +346,8 @@ class CLIWorkspaceScreen(Screen):
                     self.write(result.text)
                 if line.strip().lower() == "help":
                     self.write("Workspace: files / F6 opens the file explorer; help files explains it. "
-                               "preview / F5 opens the painting viewer; F3 / Esc returns or exits.")
+                               "preview / F5 opens the painting viewer; F3 / Esc returns or exits. "
+                               "Alt+C / Alt+X / Alt+V copies, cuts and pastes image pixels.")
             command_completed = True
             self._refresh_document(result)
             if result.quit_requested:
@@ -319,6 +360,34 @@ class CLIWorkspaceScreen(Screen):
                 self._refresh_document(CommandResult(changed=True,
                     document_replaced=self.document is not previous_document))
         self._refocus()
+
+    def open_ai_settings(self, pending_line=None):
+        from .mcp_settings import MCPSettingsScreen
+        def closed(value):
+            if pending_line:
+                self.prefill_command(pending_line)
+            self._refocus()
+        self.app.push_screen(MCPSettingsScreen(self.session.config), closed)
+
+    async def _remote_command(self, line):
+        try:
+            result = await asyncio.to_thread(self.session.execute, line)
+            if self._workspace_widgets_ready():
+                if result.text: self.write(result.text)
+                self._refresh_document(result)
+        except (CommandError, ValueError, OSError) as error:
+            if self._workspace_widgets_ready(): self.write_error(error)
+        finally:
+            self.remote_busy = False
+            if self._workspace_widgets_ready():
+                self.query_one("#cli-command-line", CLIInput).disabled = False
+                self.update_status()
+                self.publish_debug(force=True)
+                self._refocus()
+
+    def _workspace_widgets_ready(self):
+        # Child widgets can unmount before the owning screen during shutdown.
+        return self.is_mounted and len(self.query("#cli-command-line")) > 0 and len(self.query("#cli-document-status")) > 0
 
     def _state_signature(self):
         doc = self.document
@@ -355,6 +424,14 @@ class CLIWorkspaceScreen(Screen):
     def complete_command(self):
         field = self.query_one("#cli-command-line", CLIInput)
         value = field.value.lstrip()
+        candidates = syntax_completions(value)
+        if candidates is not None:
+            if len(candidates) == 1:
+                field.value = candidates[0] + " "
+                field.cursor_position = len(field.value)
+            elif candidates:
+                self.write("  ".join(candidates))
+            return
         if " " not in value:
             choices = sorted({*HELP, "preview", "files", *(('view',) if self.on_view_command else ())})
             prefix = value
@@ -396,6 +473,15 @@ class CLIWorkspaceScreen(Screen):
 
     def action_help(self):
         self.submit_command("help")
+
+    def action_copy_image(self):
+        self.execute_command("copy")
+
+    def action_cut_image(self):
+        self.execute_command("cut")
+
+    def action_paste_image(self):
+        self.execute_command("paste")
 
     def action_tools(self):
         self.submit_command("tools categories")
@@ -451,12 +537,12 @@ class CLIWorkspaceScreen(Screen):
         from .storage import project_roots
         explorer = FileExplorer(operation, start, default_name, config=self.session.config,
                                 allow_operations=not arguments, validator=self._validate_file_choice,
-                                project_dir=project_roots()[0])
+                                project_dir=project_roots()[0], canvas_size=self.document.size)
         self.app.push_screen(explorer, self._file_chosen)
 
     def _validate_file_choice(self, choice):
         from .file_explorer import FileChoice
-        from .storage import resolve_export_path, validate_export_directory
+        from .storage import export_dimensions, resolve_export_path, validate_export_directory
         if choice.operation not in FILE_OPERATIONS:
             raise ValueError("Choose a supported file operation.")
         path = self.session._path(choice.path)
@@ -473,15 +559,21 @@ class CLIWorkspaceScreen(Screen):
         if choice.operation == "export":
             suffix = path.suffix.lower()
             if suffix not in (".png", ".webp", ".tif", ".tiff", ".jpg", ".jpeg",
-                              ".gif", ".bmp", ".txt", ".ansi"):
-                raise ValueError("Choose PNG, WebP, TIFF, JPEG, GIF, BMP, TXT or ANSI.")
+                              ".gif", ".bmp", ".txt", ".ansi", ".ora"):
+                raise ValueError("Choose PNG, WebP, TIFF, ORA, JPEG, GIF, BMP, TXT or ANSI.")
             if (suffix in (".jpg", ".jpeg", ".gif", ".bmp") and
                     self.session.config.get("export.lossless") and not choice.allow_lossy):
                 raise ValueError("This format cannot preserve every RGBA pixel. Use PNG, TIFF "
                                  "or lossless WebP, or explicitly allow lossy export.")
             if type(choice.columns) is not int or not 1 <= choice.columns <= 500:
                 raise ValueError("Text export columns must be between 1 and 500.")
-        return FileChoice(path, choice.operation, choice.columns, choice.allow_lossy)
+            if suffix not in (".txt", ".ansi"):
+                if suffix == ".ora" and choice.scale != 1:
+                    raise ValueError("OpenRaster preserves layers at canvas size (scale 1).")
+                export_dimensions(self.document.size, choice.scale, extension=suffix)
+            elif choice.scale != 1:
+                raise ValueError("Export scale applies to image files; use text columns instead.")
+        return FileChoice(path, choice.operation, choice.columns, choice.allow_lossy, choice.scale)
 
     def _file_chosen(self, choice):
         if choice is None:
@@ -515,6 +607,8 @@ class CLIWorkspaceScreen(Screen):
         line = f"{operation} {quote_command_argument(choice.path)}"
         if choice.operation == "export":
             line += f" --columns {choice.columns}"
+            if choice.path.suffix.lower() not in (".txt", ".ansi"):
+                line += f" --scale {choice.scale}"
             if choice.allow_lossy:
                 line += " --allow-lossy"
         self.submit_command(line)
@@ -549,9 +643,11 @@ class CLIWorkspaceScreen(Screen):
         self.update_preview_status()
 
     def action_return(self):
+        if self.remote_busy: return
         self.action_quit()
 
     def action_quit(self):
+        if self.remote_busy: return
         if self.on_exit is not None:
             self._close_preview()
             self.on_exit()

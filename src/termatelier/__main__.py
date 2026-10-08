@@ -8,7 +8,7 @@ from .commands import CommandError, CommandSession
 from .config import RuntimeConfig, parse_overrides
 from .diagnostics import publish_diagnostics
 from .model import Document
-from .storage import export, import_document, load_project, save_project
+from .storage import export, export_dimensions, import_document, load_project, save_project
 from .terminal import configure_output, print_text as print, ui_unavailable_reason
 
 
@@ -88,6 +88,7 @@ def main(argv=None):
     parser.add_argument("--new", metavar="WxH", help="New canvas, e.g. 160x100")
     parser.add_argument("--demo", action="store_true", help="Open the layered twilight demonstration")
     parser.add_argument("--export", metavar="PATH", nargs="?", const="", help="Export outside the project; omitted PATH uses a PNG filename")
+    parser.add_argument("--export-scale", metavar="N", type=int, help="Enlarge image exports by an integer 1..16 with crisp pixels; default uses export.scale")
     parser.add_argument("--allow-lossy", action="store_true", help="Allow JPEG/GIF/BMP export; all image dimensions are preserved")
     parser.add_argument("--set", metavar="NAME=VALUE", action="append", help="Override a validated preference for this run; repeatable")
     parser.add_argument("--low-memory", action="store_true", help="Compress undo, limit it to 8 steps / 16 MiB, and disable desktop helpers; original image pixels are preserved")
@@ -107,6 +108,8 @@ def main(argv=None):
     mode.add_argument("--repl", action="store_true", help="Use the plain line REPL, including on an interactive terminal")
     mode.add_argument("--ui", action="store_true", help="Open the mouse-driven editor after any batch edits")
     args = parser.parse_args(argv)
+    if args.export_scale is not None and args.export is None:
+        parser.error("--export-scale requires --export; within editing commands use export --scale N.")
     if sum(bool(x) for x in (args.file, args.new, args.demo)) > 1:
         parser.error("Choose one input: file, --new or --demo.")
     try:
@@ -146,8 +149,14 @@ def main(argv=None):
                     if result.text: print(result.text)
         doc = session.document
         if has_export:
-            destination = export(doc, args.export or None, args.columns, allow_lossy=args.allow_lossy, config=config)
-            print(f"Exported {destination} · {doc.width}×{doc.height} pixels.")
+            destination = export(doc, args.export or None, args.columns, allow_lossy=args.allow_lossy,
+                                 config=config, scale=args.export_scale)
+            if destination.suffix.lower() in (".txt", ".ansi"):
+                print(f"Exported {destination}.")
+            else:
+                width, height = export_dimensions(doc.size, config.get("export.scale") if args.export_scale is None
+                                                  else args.export_scale, extension=destination.suffix)
+                print(f"Exported {destination} · {width}×{height} pixels.")
         if args.save_project:
             save_project(doc, args.save_project)
             session.project_path = Path(args.save_project).expanduser().resolve()

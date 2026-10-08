@@ -13,8 +13,9 @@ from PIL import Image, ImageColor
 from .model import BLENDS, MAX_LAYERS, Document, Layer, valid_size
 
 FORMAT = "org.termatelier.project"
-VERSION = 1
+VERSION = 2
 MAX_PROJECT_BYTES = 128 * 1024 * 1024
+MAX_MANIFEST_BYTES = 12 * 1024 * 1024
 
 
 def project_roots():
@@ -81,7 +82,7 @@ def _validate_manifest(data):
     """Validate the editable structure before allocating any decoded images."""
     if not isinstance(data, dict):
         raise ValueError("Manifest must be a JSON object.")
-    if data.get("format") != FORMAT or type(data.get("version")) is not int or data["version"] != VERSION:
+    if data.get("format") != FORMAT or type(data.get("version")) is not int or data["version"] not in (1, VERSION):
         raise ValueError("Unsupported project format or version.")
     width, height = data["width"], data["height"]
     valid_size(width, height)
@@ -112,12 +113,17 @@ def _validate_manifest(data):
             raise ValueError("Invalid layer name.")
         reference(entry["image"])
         reference(entry.get("mask"), optional=True)
+        from .document_tools import validate_effects, validate_text_recipe
+        validate_effects(entry.get("effects", []))
+        validate_text_recipe(entry.get("text_recipe"))
     active = data["active"]
     if type(active) is not int or not 0 <= active < len(entries):
         raise ValueError("Invalid active layer.")
     metadata, settings = data.get("metadata", {}), data.get("settings", {})
     if not isinstance(metadata, dict) or not isinstance(settings, dict):
         raise ValueError("Invalid metadata.")
+    from .document_tools import validate_metadata
+    validate_metadata(metadata, (width, height))
     if not isinstance(metadata.get("title", "Untitled"), str):
         raise ValueError("Invalid project title.")
     for key in ("guides_x", "guides_y"):
@@ -135,6 +141,19 @@ def _validate_manifest(data):
             if not isinstance(color, str):
                 raise ValueError("Invalid palette color.")
             ImageColor.getrgb(color)
+    if "retouch_options" in settings:
+        from .native_options import validate_retouch_options
+        validate_retouch_options(settings["retouch_options"])
+    for name, maximum in (("clone_source", 1), ("foreground_marks", 32)):
+        if name in settings:
+            from .painting_tools import checked_points
+            points = [settings[name]] if name == "clone_source" else settings[name]
+            if not isinstance(points, list) or len(points) > maximum:
+                raise ValueError("Invalid stored source points.")
+            for point in points:
+                if not isinstance(point, (list, tuple)) or len(point) != 2 or any(type(v) not in (int, float) for v in point):
+                    raise ValueError("Invalid stored source point coordinates.")
+            if points: checked_points(points, 1, maximum)
 
 
 def _reject_nonfinite(value):
@@ -169,11 +188,12 @@ def save_project(doc, path):
         manifest["layers"].append({"name": layer.name, "image": f"layers/{index}.png",
                                    "visible": layer.visible, "locked": layer.locked,
                                    "opacity": layer.opacity, "blend": layer.blend,
-                                   "mask": f"masks/{index}.png" if layer.mask is not None else None})
+                                   "mask": f"masks/{index}.png" if layer.mask is not None else None,
+                                   "effects": layer.effects, "text_recipe": layer.text_recipe})
     manifest["selection"] = "selection.png" if doc.selection is not None else None
     _validate_manifest(manifest)
     manifest_json = json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False)
-    if len(manifest_json.encode("utf-8")) > 1024*1024:
+    if len(manifest_json.encode("utf-8")) > MAX_MANIFEST_BYTES:
         raise ValueError("Manifest is too large.")
     for layer in doc.layers:
         if layer.image.mode != "RGBA" or layer.image.size != doc.size:
@@ -203,7 +223,7 @@ def load_project(path):
                 raise ValueError("Invalid archive entry count or duplicate entries.")
             if sum(x.file_size for x in infos) > MAX_PROJECT_BYTES:
                 raise ValueError("Project exceeds the 128 MiB archive limit.")
-            if archive.getinfo("manifest.json").file_size > 1024*1024:
+            if archive.getinfo("manifest.json").file_size > MAX_MANIFEST_BYTES:
                 raise ValueError("Manifest is too large.")
             data = json.loads(archive.read("manifest.json"), parse_constant=_reject_nonfinite)
             _validate_manifest(data)
@@ -222,7 +242,8 @@ def load_project(path):
                 name = entry["name"]
                 layers.append(Layer(name, read_image(entry["image"], "RGBA"), entry.get("visible", True),
                                     entry.get("locked", False), opacity, blend,
-                                    read_image(entry["mask"], "L") if entry.get("mask") else None))
+                                    read_image(entry["mask"], "L") if entry.get("mask") else None,
+                                    entry.get("effects", []), entry.get("text_recipe")))
             active = data["active"]
             doc = Document(width, height)
             doc.layers, doc.active = layers, active
@@ -239,6 +260,9 @@ def load_project(path):
 
 
 def open_image(path):
+    if Path(path).suffix.lower() == ".ora":
+        from .ora_tools import load_ora
+        return load_ora(path).composite()
     with Image.open(Path(path).expanduser()) as image:
         valid_size(*image.size)
         # Honor camera orientation; use the first frame for animated imports.
@@ -247,6 +271,9 @@ def open_image(path):
 
 
 def import_document(path):
+    if Path(path).suffix.lower() == ".ora":
+        from .ora_tools import load_ora
+        return load_ora(path)
     image = open_image(path)
     doc = Document(*image.size)
     doc.layers = [Layer(Path(path).stem, image)]
@@ -256,7 +283,25 @@ def import_document(path):
     return doc
 
 
-def export_image(doc, path=None, *, allow_lossy=False, config=None):
+MAX_EXPORT_PIXELS = 16_777_216
+
+
+def export_dimensions(size, scale=1, *, extension=None):
+    """Validate crisp integer enlargement before allocating export pixels."""
+    if type(scale) is not int or not 1 <= scale <= 16:
+        raise ValueError("Image export scale must be an integer from 1 to 16.")
+    if (not isinstance(size, (tuple, list)) or len(size) != 2 or
+            any(type(edge) is not int or edge < 1 for edge in size)):
+        raise ValueError("Export dimensions must be two positive integers.")
+    width, height = (edge * scale for edge in size)
+    max_edge = 16383 if extension and str(extension).lower() == ".webp" else 16384
+    if max(width, height) > max_edge or width * height > MAX_EXPORT_PIXELS:
+        raise ValueError(f"Choose a smaller image export scale: {width}×{height} exceeds "
+                         f"{max_edge:,} pixels per side or {MAX_EXPORT_PIXELS:,} pixels total.")
+    return width, height
+
+
+def export_image(doc, path=None, *, allow_lossy=False, config=None, scale=None):
     config = _runtime_config(config)
     path = resolve_export_path(path, config)
     extension = path.suffix.lower()
@@ -267,11 +312,19 @@ def export_image(doc, path=None, *, allow_lossy=False, config=None):
     if extension in (".jpg", ".jpeg", ".bmp", ".gif") and config.get("export.lossless") and not allow_lossy:
         raise ValueError("This format cannot preserve every RGBA pixel. Use PNG, TIFF or "
                          "lossless WebP, or explicitly allow lossy export.")
+    size = export_dimensions(doc.size, config.get("export.scale") if scale is None else scale,
+                             extension=extension)
+    # Export editable pixel data at full resolution. Terminal minification,
+    # zoom and overlays are presentation only and must never discard detail.
     image = doc.composite()
     if image.mode != "RGBA" or image.size != doc.size:
         raise ValueError("The image must have the original canvas dimensions and RGBA pixels.")
+    if size != doc.size:
+        # Each original pixel becomes an exact N×N block, including hidden RGB
+        # and alpha. Integer nearest sampling adds no blur or invented colors.
+        image = image.resize(size, Image.Resampling.NEAREST)
     if extension in (".jpg", ".jpeg", ".bmp"):
-        background = Image.new("RGBA", doc.size, "white")
+        background = Image.new("RGBA", size, "white")
         image = Image.alpha_composite(background, image).convert("RGB")
     options = {"quality": 95} if extension in (".jpg", ".jpeg") else {}
     if extension == ".webp":
@@ -311,10 +364,17 @@ def export_text(doc, path, columns=100, ansi=False, *, config=None):
     return path
 
 
-def export(doc, path=None, columns=100, *, allow_lossy=False, config=None):
+def export(doc, path=None, columns=100, *, allow_lossy=False, config=None, scale=None):
     config = _runtime_config(config)
     path = resolve_export_path(path, config)
     suffix = path.suffix.lower()
+    if suffix == ".ora":
+        if scale is not None and (type(scale) is not int or scale != 1):
+            raise ValueError("OpenRaster layers use the original canvas size; omit --scale or use 1.")
+        from .ora_tools import save_ora
+        return save_ora(doc, path, config=config)
     if suffix in (".txt", ".ansi"):
+        if scale is not None and (type(scale) is not int or scale != 1):
+            raise ValueError("Export scale applies to image files; use --columns for text exports.")
         return export_text(doc, path, columns, suffix == ".ansi", config=config)
-    return export_image(doc, path, allow_lossy=allow_lossy, config=config)
+    return export_image(doc, path, allow_lossy=allow_lossy, config=config, scale=scale)

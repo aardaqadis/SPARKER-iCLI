@@ -5,12 +5,14 @@
 Ever had the need to have MS paint in your command prompt? No? Download it anyway!
  
 A terminal paint editor with mouse drawing, layers, selections, brushes, shapes,
-filters, undo/redo and **1,248 art tools**. Use the canvas or editing commands.
+filters, undo/redo and **1,248 art tools**. The CLI also supports image copy/paste,
+curves, pixel edits, selection adjustments and advanced text layout.
+Native tools also include clone/heal, airbrush, smudge, foreground/scissors
+selections, perspective/warp transforms, color curves, editable paths, saved
+channels, text source editing and layer effect stacks. Type `features` for
+the tool families and their limits; these use SPARKER's own raster algorithms.
 
 ## Start
-=======
-SPARKER iCLI is a raster canvas editor inside of any command line interface. Consuming less memory than Microsoft paint, it offers an optimised way of digitally producing art.
->>>>>>> 086c2798747f0a50eb21600ba4f25ec6385fa090
 
 Install **Python 3.11+**, then run from this folder:
 
@@ -40,15 +42,20 @@ to 8 checkpoints / 16 MiB. Image quality stays unchanged; compression uses extra
 | Commands / tools / files | F3 / F5 / F6 |
 | Save / export / open | Ctrl+S / Ctrl+E / Ctrl+O |
 | Undo / redo | Ctrl+Z / Ctrl+Y |
+| Copy / cut / paste image in CLI | Alt+C / Alt+X / Alt+V |
 | Help / quit | F1 / Ctrl+Q |
 
 ## Commands and files
 
-Type `help` or `help COMMAND` in the command view. For example:
+Type `help`, `help COMMAND` or `commands QUERY` in the command view. Tab completes
+command names, subcommands and options. For example:
 
 ```text
 new 128x96
 pencil 10,10 80,60 --color orange
+copy --merged --box 10,10,81,61
+paste --center --flip-h --name Copy
+text 64 8 "Hello" --size 18 --anchor top-center --stroke 1 --layer Title
 tools search oak
 save study.tart
 export study.png
@@ -57,10 +64,30 @@ config set memory.mode low
 ```
 
 Use `config set memory.mode standard` to restore normal memory settings.
-`.tart` saves editable layers and metadata. PNG, TIFF and WebP preserve canvas
-dimensions and RGBA pixels; ASCII/ANSI exports create text art.
+`.tart` saves original editable layers and metadata. Standard image exports retain
+every original canvas pixel at the exact canvas width and height. Zoom, preview
+sampling, grid and guides never affect exported detail. PNG, TIFF and WebP encode
+losslessly, including transparency. ASCII/ANSI exports create text art.
+Use `export detail.png --scale 4` or the explorer's Scale field for crisp 4×
+enlargement; a 960×640 canvas becomes 3840×2560, with every pixel preserved.
+Set `config set export.scale 4` to make it the default; set it to `1` to restore
+canvas-sized exports. Enlargements are limited to 16,777,216 pixels.
 JPEG/GIF/BMP require `--allow-lossy`. Exports go to
 `Pictures/SPARKER-iCLI/Exports` or your configured folder, outside the app.
+OpenRaster (`.ora`) imports/exports raster layers at canvas size with supported
+blend modes; masks/effects are baked into those layers. Use `.tart` to retain
+editable paths, channels, text sources and effects. Earlier `.tart` files open.
+
+For external AI tools, install optional support from this folder:
+Windows: `.venv\Scripts\python.exe -m pip install ".[mcp]"`;
+Linux/macOS: `.venv/bin/python -m pip install ".[mcp]"`.
+Open **Tools → AI / MCP connections**
+or type `ai settings`: SPARKER prompts for the service URL or launch command,
+discovers tools, and lets you map background removal, upscaling and other tasks.
+Authentication uses an environment-variable name. Your service supplies the AI;
+SPARKER includes no models or accounts. The first unconfigured AI command opens
+settings. `help ai` shows inputs, output options and result handling.
+`sparker-mcp` starts SPARKER's own stdio MCP server for external editing clients.
 
 ## Development
 
@@ -73,64 +100,4 @@ python -m build
 ```
 
 
-Built with Textual and Pillow. [MIT license](LICENSE).
-=======
-The Windows launchers include a borderless logo loading screen and a configurable
-debug overlay. `--no-debug` hides the overlay; `debug off` in the command workspace
-turns it off while editing.
-
-## What it does
-
-- Brush, pencil, eraser, fills, gradients, text and geometric shapes; mouse drag,
-  zoom and pan with continuous thin-stroke previews at Fit.
-- Layers, masks, opacity and blend modes; selections, transforms, filters,
-  palettes, guides and a grid, with shared undo/redo.
-- A searchable library of 600 stamps, 200 textured brushes, 400 patterns and
-  48 image effects. Color, size and angle settings are separate from that count.
-- **F3** opens the full-screen CLI and detached live painting preview;
-  **F5** opens the tool library; **F6** opens the shared file explorer.
-- Editable **.tart** projects preserve layers, masks and metadata. PNG, TIFF and
-  WebP exports preserve original dimensions and RGBA pixels. ASCII and ANSI
-  exports produce text representations. JPEG/GIF/BMP require explicit lossy opt-in.
-
-Exports default to **Pictures\SPARKER-iCLI\Exports**, outside the application
-folder. Display zoom and terminal character resolution do not resize saved images.
-
-## Documentation
-
-- [Complete usage and shortcuts](USAGE.md)
-- [Command reference](COMMANDS.md)
-- [Art tool catalog](TOOLS.md)
-- [Native project format](FORMAT.md)
-- [Verification](TESTING.md) and [performance measurements](PERFORMANCE.md)
-- [Contributing and local checks](CONTRIBUTING.md)
-- [Changes](CHANGELOG.md)
-
-Application code lives in **src/** and tests in **tests/**. The internal
-`termatelier` package name and .tart identifier are retained for compatibility;
-the public commands are `sparker` and `sparkericli`.
-
-## Install with Python
-
-From the repository root:
-
-```powershell
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\python.exe -m sparkericli
-```
-
-On Linux/macOS, use `python3 -m venv .venv`, then
-`.venv/bin/python -m pip install -e .` and
-`.venv/bin/python -m sparkericli`. Native windows require Tk; terminal painting
-and plain command editing remain usable without it. The Windows logo/debug
-integration is specific to the Windows launchers.
-
-## Scope and license
-
-This is a raster editor. Vector paths, editable text objects, tablet pressure,
-animation timelines, CMYK/ICC workflows and layered PSD/XCF import are absent.
-See the detailed usage guide for document and history limits.
-
-Built with Textual and Pillow. Released under the existing [MIT license](LICENSE).
-
+Built with Textual, Pillow and NumPy. [MIT license](LICENSE).

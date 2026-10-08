@@ -114,13 +114,14 @@ async def test_first_save_open_and_import_undo_use_browser(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_browser_png_is_pixel_exact_and_text_columns_only_affect_text(tmp_path):
+async def test_browser_png_preserves_all_pixels_and_text_columns_only_affect_text(tmp_path):
     app = Studio(patterned_document())
     png, text = tmp_path / "lossless.png", tmp_path / "text drawing.txt"
     async with app.run_test(size=(140, 52)) as pilot:
         await pilot.pause()
-        expected = app.doc.composite().tobytes()
+        original = app.doc.composite().tobytes()
         app.canvas.zoom = .63
+        expected = original
         app.canvas.grid = True
         app.doc.metadata.update(guides_x=[4], guides_y=[6])
         await pilot.press("ctrl+e")
@@ -138,7 +139,7 @@ async def test_browser_png_is_pixel_exact_and_text_columns_only_affect_text(tmp_
         lines = text.read_text(encoding="utf-8").splitlines()
         assert len(lines) == round(19 * 11 / 31 / 2)
         assert all(len(line) == 11 for line in lines)
-        assert app.doc.size == (31, 19) and app.doc.composite().tobytes() == expected
+        assert app.doc.size == (31, 19) and app.doc.composite().tobytes() == original
 
 
 @pytest.mark.parametrize("operation,suffix", [("export", ".png"), ("save", ".tart"), ("debug", ".json")])

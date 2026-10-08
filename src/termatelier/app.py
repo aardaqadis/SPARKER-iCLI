@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import time
+import json
 from rich.text import Text
 from PIL import Image, ImageColor, ImageFilter, ImageOps
 from textual.app import App, ComposeResult
@@ -17,7 +18,7 @@ from .canvas import Canvas
 from .config import RuntimeConfig
 from .dialogs import Confirm, Form, Menu
 from .model import BLENDS, Document, Layer, MAX_LAYERS, valid_size
-from .storage import export, import_document, load_project, open_image, project_roots, resolve_export_path, save_project
+from .storage import export, export_dimensions, import_document, load_project, open_image, project_roots, resolve_export_path, save_project
 
 TOOLS = [("brush", "B  Brush"), ("pencil", "P  Pencil"), ("eraser", "E  Eraser"),
          ("fill", "F  Fill"), ("gradient", "G  Gradient"), ("text", "T  Text"),
@@ -26,6 +27,12 @@ TOOLS = [("brush", "B  Brush"), ("pencil", "P  Pencil"), ("eraser", "E  Eraser")
          ("lasso", "   Lasso"), ("wand", "W  Magic wand"), ("picker", "I  Picker"),
          ("move", "M  Move"), ("hand", "H  Pan")]
 TOOLS.append(("library", "   Library tool"))
+TOOLS.extend((name, "   " + label) for name, label in (
+    ("clone", "Clone"), ("heal", "Heal"), ("perspective-clone", "Perspective clone"),
+    ("smudge", "Smudge"), ("blur", "Blur brush"), ("sharpen", "Sharpen brush"),
+    ("dodge", "Dodge"), ("burn", "Burn"), ("airbrush", "Airbrush"),
+    ("ink", "Calligraphy"), ("natural", "Natural media"),
+    ("select_color", "Select by color"), ("scissors", "Scissors"), ("foreground", "Foreground")))
 MENUS = {
     "File": [("new", "New canvas                 Ctrl+N"), ("open", "Open project / image       Ctrl+O"),
              ("save", "Save project               Ctrl+S"), ("save_as", "Save project as…"),
@@ -69,6 +76,15 @@ MENUS = {
     "Help": [("help", "Controls and commands"), ("debug_info", "Runtime debug information"),
              ("runtime_settings", "Runtime settings and variables"), ("about", "About SPARKER iCLI")],
 }
+MENUS["Tools"].extend([
+    ("retouch_options", "Painting / retouch options…"),
+    ("geometry_tools", "Advanced transforms…"), ("path_tools", "Editable paths…"),
+    ("channel_tools", "Saved channels…"), ("features", "Feature families in CLI"),
+    ("ai_settings", "AI / MCP connections…")])
+MENUS["Filters"].extend([( "tone_tools", "Tone controls…"),
+    ("native_effects", "Native effects…"), ("effect_stack", "Editable effect stack…")])
+MENUS["Select"].extend([( "tool_scissors", "Scissors outline tool"),
+    ("tool_foreground", "Foreground outline tool"), ("tool_select_color", "Select by color tool")])
 
 
 class CommandInput(Input):
@@ -204,9 +220,14 @@ class Studio(App):
         self.doc.history_limit = self.config.get("history.max_steps")
         self.doc.history_bytes = self.config.get("history.max_mb") * 1024 * 1024
         self.doc.history_storage = self.config.get("history.storage")
+        self.doc.cache_effects = self.config.get("memory.mode") != "low"
+        for layer in self.doc.layers:
+            layer.cache_effects = self.config.get("memory.mode") != "low"
+            layer.invalidate_effects()
         self.doc._trim()
 
     def publish_debug(self, force=False):
+        if self._cli_screen is not None and self._cli_screen.remote_busy: return
         if not os.environ.get("SPARKER_DEBUG_STATE"):
             return
         now = time.monotonic()
@@ -320,6 +341,7 @@ class Studio(App):
     def update_status(self, point=None):
         if not self.is_mounted: return
         canvas = self.canvas
+        canvas.record_export_view()
         point = point or canvas.cursor
         location = f"  x:{point[0]} y:{point[1]}" if point else ""
         name = self.project_path.name if self.project_path else "Untitled.tart"
@@ -429,7 +451,12 @@ class Studio(App):
         self._cli_screen.command_cursor = len(self.command_history)
         self.push_screen(self._cli_screen)
 
+    def check_action(self, action, parameters):
+        return not (self._cli_screen is not None and self._cli_screen.remote_busy)
+
     def store_tool_settings(self):
+        if self.is_mounted:
+            self.canvas.record_export_view()
         self.doc.settings.update({key: getattr(self, key) for key in
                                  ("foreground", "background", "brush_size", "hardness", "opacity", "tolerance",
                                   "filled", "radial", "selection_mode", "tool", "library_tool",
@@ -466,8 +493,16 @@ class Studio(App):
         field.cursor_position = len(value)
 
     def complete_command(self):
-        from .commands import HELP
+        from .commands import HELP, syntax_completions
         field = self.screen_stack[0].query_one("#command-line", CommandInput)
+        candidates = syntax_completions(field.value)
+        if candidates is not None:
+            if len(candidates) == 1:
+                field.value = candidates[0] + " "
+                field.cursor_position = len(field.value)
+            elif candidates:
+                self.screen_stack[0].query_one("#command-output", RichLog).write("  ".join(candidates))
+            return
         words = (*HELP, "view")
         prefix = field.value.strip()
         matches = [word for word in words if word.startswith(prefix)]
@@ -547,6 +582,7 @@ class Studio(App):
             self.canvas.set_resampling(self.config.get("view.resampling"))
         elif key in actions and len(parts) == 2: actions[key]()
         else: raise ValueError("Use 'view' to see available view commands.")
+        self.canvas.record_export_view()
         self.publish_debug(force=True)
         return f"View: {key}"
 
@@ -583,6 +619,9 @@ class Studio(App):
 
     def dispatch(self, key):
         if key:
+            if key.startswith("tool_"):
+                self.action_tool(key[5:])
+                return
             action = getattr(self, f"action_{key}", None)
             if action: action()
             elif key in {x[0] for x in MENUS["Filters"]}: self.filter_dialog(key)
@@ -658,6 +697,8 @@ class Studio(App):
         self.guard_document(self.exit)
 
     def replace_document(self, doc, path=None):
+        if doc.clipboard is None:
+            doc.clipboard = self.doc.clipboard
         self.doc = doc
         self.project_path = Path(path).resolve() if path else None
         if self._cli_screen is not None:
@@ -738,14 +779,20 @@ class Studio(App):
                 return
             self._export_choice(choice)
         self.push_screen(FileExplorer("export", default_path, config=self.config,
-                                      title="Export image / text", project_dir=project_roots()[0]), write)
+                                      title="Export image / text", project_dir=project_roots()[0],
+                                      canvas_size=self.doc.size), write)
 
     def _export_choice(self, choice):
         path, columns, lossy = choice.path, choice.columns, choice.allow_lossy
         def run():
             try:
-                destination = export(self.doc, path, columns, allow_lossy=lossy, config=self.config)
-                self.notify(f"Exported {self.doc.width}×{self.doc.height}: {destination}")
+                self.canvas.record_export_view()
+                destination = export(self.doc, path, columns, allow_lossy=lossy, config=self.config, scale=choice.scale)
+                if path.suffix.lower() in (".txt", ".ansi"):
+                    self.notify(f"Exported text: {destination}")
+                else:
+                    width, height = export_dimensions(self.doc.size, choice.scale, extension=path.suffix)
+                    self.notify(f"Exported {width}×{height}: {destination}")
             except (ValueError, OSError) as error: self.notify(str(error), severity="error")
         if path.exists(): self.push_screen(Confirm(f"Replace existing export?\n{path}"), lambda yes: run() if yes else None)
         else: run()
@@ -756,7 +803,7 @@ class Studio(App):
         start = self.project_path.parent if self.project_path else Path.cwd()
         self.push_screen(FileExplorer("open", start, config=self.config,
                                       title="File explorer", allow_operations=True, project_dir=project_roots()[0],
-                                      validator=self._validate_file_choice),
+                                      validator=self._validate_file_choice, canvas_size=self.doc.size),
                          self._file_choice)
 
     @staticmethod
@@ -1020,6 +1067,7 @@ class Studio(App):
                 self.doc.ensure_editable()
                 self.doc.layer.image = self.doc.layer.image.rotate(-angle, Image.Resampling.BICUBIC)
                 if self.doc.layer.mask is not None: self.doc.layer.mask = self.doc.layer.mask.rotate(-angle, Image.Resampling.BICUBIC)
+                self.doc.layer.text_recipe = None
             self.perform("Rotate layer", rotate)
         self.form("Rotate layer · clockwise, clipped to canvas", [("angle", "Degrees", 15, None)], apply,
                   lambda v: self.number(v["angle"], -360, 360))
@@ -1037,6 +1085,7 @@ class Studio(App):
                     full = Image.new(image.mode, self.doc.size)
                     full.paste(resized, ((self.doc.width-size[0])//2, (self.doc.height-size[1])//2))
                     setattr(layer, attr, full)
+                layer.text_recipe = None
             self.perform("Scale layer", scale)
         self.form("Scale active layer · centered, clipped to canvas", [("percent", "Scale %", 75, None)], apply,
                   lambda v: self.number(v["percent"], 1, 400))
@@ -1109,6 +1158,50 @@ class Studio(App):
 
     def action_runtime_settings(self):
         self.show_console_command("config list")
+
+    def action_ai_settings(self):
+        from .mcp_settings import MCPSettingsScreen
+        self.push_screen(MCPSettingsScreen(self.config))
+
+    def action_retouch_options(self):
+        from .native_options import validate_retouch_options
+        def validate(values):
+            return validate_retouch_options(json.loads(values["options"]))
+        self.form("Painting and retouch options", [
+            ("options", "Options as JSON", json.dumps(self.doc.settings.get("retouch_options", {})), None)],
+            lambda values: self.doc.settings.update(retouch_options=values), validate,
+            "strength, radius, tonal_range, exposure, rate, angle, aspect, pressure, preset, seed, density, merged.\n"
+            "Clone/heal: Ctrl-click sets the source. Perspective clone needs source_quad and dest_quad (four X,Y pairs each).\n"
+            "Foreground: Ctrl-click marks the subject, then drag its outline.\n"
+            'Example: {"strength": 0.5, "radius": 3, "merged": true}')
+
+    def command_form(self, title, default):
+        from .commands import CommandSession, tokenize
+        def validate(values):
+            line = values["command"].strip()
+            tokens = tokenize(line)
+            if not tokens or tokens[0] != tokenize(default)[0]:
+                raise ValueError("Keep the tool family shown here; use F3 for other commands.")
+            return line
+        def apply(line):
+            self.store_tool_settings()
+            session = CommandSession(self.doc, self.project_path, config=self.config)
+            try:
+                result = session.execute(line)
+                self.cli_document_changed(session, result)
+                if result.text: self.notify(result.text[:500])
+            except (ValueError, OSError) as error:
+                self.notify(str(error), severity="error")
+        self.form(title, [("command", "Command", default, None)], apply, validate,
+                  "Use F3 and help COMMAND to see every option. Edits share the painter's undo history.")
+
+    def action_geometry_tools(self): self.command_form("Advanced transforms", "geometry shear 0.2 --resample bilinear")
+    def action_path_tools(self): self.show_console_command("help path")
+    def action_channel_tools(self): self.show_console_command("help channel")
+    def action_features(self): self.show_console_command("features")
+    def action_tone_tools(self): self.command_form("Tone controls", "tone exposure --stops 1")
+    def action_native_effects(self): self.command_form("Native effects", "effect-filter gaussian-blur --radius 2")
+    def action_effect_stack(self): self.show_console_command("help fx")
 
     def show_console_command(self, command):
         if self._cli_screen is None:

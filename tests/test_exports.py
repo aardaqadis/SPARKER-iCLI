@@ -1,4 +1,4 @@
-"""Real encoders, destination policy and display/export separation."""
+"""Real encoders, destination policy and overlay-free painting exports."""
 import random
 from pathlib import Path
 from types import SimpleNamespace
@@ -151,7 +151,7 @@ def test_native_project_can_still_be_explicitly_saved_with_editable_pixels(tmp_p
 
 @pytest.mark.parametrize("mode", ["nearest", "bilinear", "bicubic"])
 @pytest.mark.asyncio
-async def test_view_sampling_zoom_and_guides_do_not_enter_export(tmp_path, mode):
+async def test_export_preserves_all_pixels_without_view_sampling_or_overlays(tmp_path, mode):
     from termatelier.app import Studio
     from termatelier.canvas import Canvas
 
@@ -173,6 +173,7 @@ async def test_view_sampling_zoom_and_guides_do_not_enter_export(tmp_path, mode)
     with Image.open(result) as restored:
         assert restored.size == (31, 19)
         assert restored.tobytes() == original
+    assert doc.composite().tobytes() == original
     assert doc.layer.image.size == (31, 19)
 
 

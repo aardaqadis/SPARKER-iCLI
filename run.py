@@ -55,7 +55,7 @@ def installation_works(python: Path, root: Path) -> bool:
     try:
         checked = _run([
             str(python), "-c",
-            "import pathlib,sys,PIL,textual,termatelier; "
+            "import pathlib,sys,PIL,textual,numpy,termatelier; "
             "expected=(pathlib.Path(sys.argv[1])/'src'/'termatelier').resolve(); "
             "assert pathlib.Path(termatelier.__file__).resolve().parent==expected",
             str(root),

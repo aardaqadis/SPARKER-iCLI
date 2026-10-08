@@ -1,3 +1,4 @@
 # Direct runtime versions used for the verified test run.
 textual==8.2.8
 Pillow==12.3.0
+numpy==2.5.3

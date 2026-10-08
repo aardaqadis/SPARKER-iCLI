@@ -85,9 +85,9 @@ async def test_recall_restores_draft_completion_errors_and_history():
         assert field.value == "brush --size 7"
         await pilot.press("down", "down")
         assert field.value == "draft command"
-        field.value = "col"
+        field.value = "cle"
         await pilot.press("ctrl+space")
-        assert field.value == "color "
+        assert field.value == "clear "
         revision = screen.document.revision
         updates = len(screen.preview.updated)
         field.value = "filter absent-effect"

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import time
 from functools import lru_cache
 from PIL import Image, ImageDraw, ImageFilter
 from rich.color import Color
@@ -10,6 +11,9 @@ from rich.style import Style
 from textual import events
 from textual.strip import Strip
 from textual.widget import Widget
+
+from .rendering import ExportView, reduction_factor, sample_rgba
+from .painting_tools import MOUSE_TOOLS, apply_stroke, color_selection, scissors_selection, foreground_selection
 
 
 @lru_cache(maxsize=8192)
@@ -50,6 +54,9 @@ class Canvas(Widget):
         self._minified_factor = 1
         self._preview_bounds = None
         self._gesture_button = 0
+        self._retouch_state = {}
+        self._spray_timer = None
+        self._spray_last = 0.0
 
     def set_resampling(self, name):
         """Change display interpolation without resizing the editable pixels."""
@@ -62,7 +69,20 @@ class Canvas(Widget):
     def doc(self):
         return self.app.doc
 
+    @property
+    def export_view(self):
+        """Sampling of the painting, independent of pan and editor overlays."""
+        config = getattr(self.app, "config", None)
+        mode = config.get("view.resampling", self.resampling) if config is not None else self.resampling
+        return ExportView(self.zoom, mode)
+
+    def record_export_view(self):
+        """Record terminal view state; storage exports only native pixels."""
+        self.doc.export_view = self.export_view
+        return self.doc.export_view
+
     def invalidate(self, artwork=True):
+        self.record_export_view()
         self.cache = None
         self._row_cache.clear()
         if artwork:
@@ -102,7 +122,7 @@ class Canvas(Widget):
 
     def _composite_signature(self):
         return (id(self.doc), self.doc.size, self.doc.revision, tuple((id(layer), id(layer.image), id(layer.mask),
-                layer.visible, layer.opacity, layer.blend) for layer in self.doc.layers))
+                layer.visible, layer.opacity, layer.blend, repr(layer.effects)) for layer in self.doc.layers))
 
     def _smooth_source(self):
         signature = self._composite_signature()
@@ -117,7 +137,7 @@ class Canvas(Widget):
         # Each source pixel contributes to an alpha-aware area average before
         # viewport sampling. Upsampling this reduced image cannot skip a whole
         # covered cell, as nearest decimation did for thin zoomed-out strokes.
-        factor = max(1, math.ceil(1/self.zoom))
+        factor = reduction_factor(self.zoom)
         if self._minified is None or self._minified_factor != factor:
             self._minified = source.reduce(factor)
             self._minified_factor = factor
@@ -130,6 +150,10 @@ class Canvas(Widget):
                 min(self.doc.height, math.ceil(box[3]/factor)*factor))
 
     def _patch_composite(self, box):
+        self.doc.layer.invalidate_effects()
+        if self.doc.layer.effects:
+            # Blur, shadow and distortions can affect pixels beyond the brush.
+            box = None
         if self._smooth_composite is not None:
             if box is None:
                 self._smooth_composite = self._smooth_signature = None
@@ -145,14 +169,14 @@ class Canvas(Widget):
 
     def screen_image(self):
         width, height = max(1, self.size.width), max(1, self.size.height*2)
-        config = getattr(self.app, "config", None)
-        mode = config.get("view.resampling", self.resampling) if config is not None else self.resampling
+        view = self.record_export_view()
+        mode = view.resampling
         resampling = {"nearest": Image.Resampling.NEAREST,
                       "bilinear": Image.Resampling.BILINEAR,
                       "bicubic": Image.Resampling.BICUBIC}[mode]
         affine = (1/self.zoom, 0, self.pan_x, 0, 1/self.zoom, self.pan_y)
         if self.zoom < 1:
-            factor = max(1, math.ceil(1/self.zoom))
+            factor = reduction_factor(self.zoom)
             if self.preview is not None and self.preview.mode == "RGBA":
                 source = self.preview.reduce(factor)
             else:
@@ -166,10 +190,11 @@ class Canvas(Widget):
                         patch.paste((244, 226, 133, 255), (0, 0), self.preview.crop(box))
                         source = source.copy()
                         source.paste(patch.reduce(factor), (box[0]//factor, box[1]//factor))
-            affine = tuple(value/factor for value in affine)
-            result = source.transform((width, height), Image.Transform.AFFINE, affine, resampling)
+            result = sample_rgba(source, (width, height), self.zoom, factor,
+                                 (self.pan_x, self.pan_y), mode)
         elif self.preview is not None and self.preview.mode == "RGBA":
-            result = self.preview.transform((width, height), Image.Transform.AFFINE, affine, resampling)
+            result = sample_rgba(self.preview, (width, height), self.zoom,
+                                 pan=(self.pan_x, self.pan_y), resampling=mode)
         elif self.preview is not None and resampling != Image.Resampling.NEAREST:
             # Interpolation must sample the contour together with the original
             # pixels; retaining one immutable composite avoids rebuilding layers.
@@ -177,12 +202,14 @@ class Canvas(Widget):
                 self._preview_base = self._smooth_source()
             source = self._preview_base.copy()
             source.paste((244, 226, 133, 255), (0, 0), self.preview)
-            result = source.transform((width, height), Image.Transform.AFFINE, affine, resampling)
+            result = sample_rgba(source, (width, height), self.zoom,
+                                 pan=(self.pan_x, self.pan_y), resampling=mode)
         else:
             if resampling == Image.Resampling.NEAREST:
                 result = self.doc.composite_view((width, height), affine, resampling)
             else:
-                result = self._smooth_source().transform((width, height), Image.Transform.AFFINE, affine, resampling)
+                result = sample_rgba(self._smooth_source(), (width, height), self.zoom,
+                                     pan=(self.pan_x, self.pan_y), resampling=mode)
             if self.preview is not None:
                 contour = self.preview.transform((width, height), Image.Transform.AFFINE,
                                                  affine, Image.Resampling.NEAREST)
@@ -261,6 +288,16 @@ class Canvas(Widget):
         if event.button != 1 or not self.inside(point): return
         app, doc = self.app, self.doc
         try:
+            if event.ctrl and app.tool in ("clone", "heal", "perspective-clone"):
+                doc.settings["clone_source"] = list(point)
+                app.notify(f"Source: {point[0]},{point[1]}")
+                return
+            if event.ctrl and app.tool == "foreground":
+                marks = doc.settings.setdefault("foreground_marks", [])
+                if len(marks) >= 32: marks.pop(0)
+                marks.append(list(point))
+                app.notify(f"Foreground mark {len(marks)} set. Drag an outline around these marks.")
+                return
             if app.tool == "picker":
                 pixel = doc.composite((*point, point[0]+1, point[1]+1)).getpixel((0, 0))
                 app.foreground = "#%02x%02x%02x" % pixel[:3]
@@ -279,6 +316,11 @@ class Canvas(Widget):
                     doc.set_selection(doc.region_mask(point, app.tolerance, True), app.selection_mode)
                 app.sync_ui()
                 return
+            if app.tool == "select_color":
+                with doc.edit("By color selection"):
+                    doc.set_selection(color_selection(doc, point, tolerance=app.tolerance, merged=True), app.selection_mode)
+                app.sync_ui()
+                return
             if app.tool == "library":
                 from .tool_library import get_tool
                 spec = get_tool(app.library_tool)
@@ -286,7 +328,7 @@ class Canvas(Widget):
                     app.action_apply_library()
                     return
                 app.store_tool_settings()
-            if not app.tool.startswith("select") and app.tool != "lasso": doc.ensure_editable()
+            if not app.tool.startswith("select") and app.tool not in ("lasso", "scissors", "foreground"): doc.ensure_editable()
             doc.begin(spec.name if app.tool == "library" else app.tool.replace("_", " ").title())
             self.dragging = True
             self._gesture_button = event.button
@@ -302,8 +344,12 @@ class Canvas(Widget):
             self._stroke_options = self._last_gesture_key = None
             self._library_tip_key = self._library_tip = None
             self._preview_bounds = None
+            self._retouch_state = {}
+            self._spray_last = time.monotonic()
             self.capture_mouse()
             self.update_gesture(point)
+            if app.tool == "airbrush":
+                self._spray_timer = self.set_interval(.08, self._spray_tick)
         except (ValueError, OSError) as error:
             doc.cancel()
             self.release_mouse()
@@ -315,6 +361,7 @@ class Canvas(Widget):
             self._library_tip_key = self._library_tip = None
             self._preview_bounds = None
             self._stroke_count = self._stroke_dabs = 0
+            self._stop_spray()
             self.invalidate()
             app.notify(str(error), severity="warning")
 
@@ -470,7 +517,17 @@ class Canvas(Widget):
         app, doc = self.app, self.doc
         tool = app.tool
         self._last_gesture_key = self._gesture_key()
-        if tool == "library":
+        if tool in MOUSE_TOOLS:
+            options = dict(doc.settings.get("retouch_options", {}))
+            if tool == "airbrush":
+                now = time.monotonic()
+                options["duration"] = max(.01, min(1, now - self._spray_last))
+                self._spray_last = now
+            box = apply_stroke(doc, tool, self.points, size=app.brush_size,
+                               hardness=app.hardness, opacity=app.opacity, color=app.foreground,
+                               state=self._retouch_state, **options)
+            if box is not None: self._patch_composite(box)
+        elif tool == "library":
             self._paint_library(point)
         elif tool in ("brush", "pencil", "eraser"):
             self._paint_stroke(tool)
@@ -480,22 +537,48 @@ class Canvas(Widget):
         elif tool in ("line", "rectangle", "ellipse"):
             self._paint_shape(tool, point)
         # Selection and gradient previews use a shape contour, without changing selection.
-        elif tool.startswith("select") or tool == "lasso" or tool == "gradient":
+        elif tool.startswith("select") or tool in ("lasso", "scissors", "foreground", "gradient"):
             if self.preview is None: self.preview = Image.new("L", doc.size)
             else: self.preview.paste(0, (0, 0, doc.width, doc.height))
             draw = ImageDraw.Draw(self.preview)
-            if tool == "lasso" and len(self.points) > 1: draw.line(self.points, fill=255, width=1)
+            if tool in ("lasso", "scissors", "foreground") and len(self.points) > 1: draw.line(self.points, fill=255, width=1)
             elif tool == "gradient": draw.line((self.origin, point), fill=255, width=1)
             else:
                 x0, x1 = sorted((self.origin[0], point[0]))
                 y0, y1 = sorted((self.origin[1], point[1]))
                 fn = draw.ellipse if tool == "select_ellipse" else draw.rectangle
                 fn((x0, y0, x1, y1), outline=255)
-            vertices = self.points if tool == "lasso" else (self.origin, point)
+            vertices = self.points if tool in ("lasso", "scissors", "foreground") else (self.origin, point)
             self._preview_bounds = self._clip_box((min(p[0] for p in vertices)-1,
                 min(p[1] for p in vertices)-1, max(p[0] for p in vertices)+2,
                 max(p[1] for p in vertices)+2))
         self.invalidate(artwork=False)
+
+    def _stop_spray(self):
+        if self._spray_timer is not None:
+            self._spray_timer.stop()
+            self._spray_timer = None
+        self._retouch_state = {}
+
+    def _spray_tick(self):
+        if not self.dragging or self.panning or self.app.tool != "airbrush":
+            self._stop_spray()
+            return
+        # A held spray deposits fresh paint even without motion reports.
+        now = time.monotonic()
+        options = dict(self.doc.settings.get("retouch_options", {}))
+        options["duration"] = max(.01, min(1, now - self._spray_last))
+        self._spray_last = now
+        try:
+            box = apply_stroke(self.doc, "airbrush", [self.points[-1]],
+                size=self.app.brush_size, hardness=self.app.hardness,
+                opacity=self.app.opacity, color=self.app.foreground,
+                state={}, **options)
+            if box is not None: self._patch_composite(box)
+            self.invalidate(artwork=False)
+        except (ValueError, OSError) as error:
+            self.action_cancel_gesture()
+            self.app.notify(str(error), severity="warning")
 
     def on_mouse_move(self, event: events.MouseMove):
         point = self.image_point(event)
@@ -512,6 +595,9 @@ class Canvas(Widget):
         else:
             if point != self.points[-1] or self._gesture_key() != self._last_gesture_key:
                 if point != self.points[-1]: self.points.append(point)
+                if self.app.tool in MOUSE_TOOLS and len(self.points) > 2048:
+                    self.points = self.points[-2:]
+                    self._retouch_state.pop("path", None)
                 try:
                     self.update_gesture(point)
                 except (ValueError, OSError) as error:
@@ -529,7 +615,18 @@ class Canvas(Widget):
                     if point != self.points[-1]: self.points.append(point)
                     self.update_gesture(point)
                 tool, app = self.app.tool, self.app
-                if tool.startswith("select") or tool == "lasso":
+                if tool in ("scissors", "foreground"):
+                    maximum = 32 if tool == "scissors" else 64
+                    vertices = self.points
+                    if len(vertices) > maximum:
+                        vertices = [vertices[round(i*(len(vertices)-1)/(maximum-1))] for i in range(maximum)]
+                    if tool == "scissors":
+                        mask = scissors_selection(self.doc, vertices, merged=True)
+                    else:
+                        mask = foreground_selection(self.doc, vertices,
+                            self.doc.settings.get("foreground_marks", []), merged=True)
+                    self.doc.set_selection(mask, app.selection_mode)
+                elif tool.startswith("select") or tool == "lasso":
                     kind = "ellipse" if tool == "select_ellipse" else ("lasso" if tool == "lasso" else "rectangle")
                     self.doc.select(kind, self.origin, point, app.selection_mode, self.points)
                 elif tool == "gradient":
@@ -543,6 +640,7 @@ class Canvas(Widget):
             self.doc.cancel()
             self.app.notify(str(error), severity="error")
         finally:
+            self._stop_spray()
             self.release_mouse()
             self.dragging = self.panning = False
             self._gesture_button = 0
@@ -555,6 +653,7 @@ class Canvas(Widget):
             self.app.sync_ui(artwork=False)
 
     def action_cancel_gesture(self):
+        self._stop_spray()
         if self.dragging:
             self.doc.cancel()
             self.release_mouse()

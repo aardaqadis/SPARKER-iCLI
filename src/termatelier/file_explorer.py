@@ -33,6 +33,7 @@ class FileChoice:
     operation: str
     columns: int = 100
     allow_lossy: bool = False
+    scale: int = 1
 
 
 OPERATIONS = {
@@ -41,11 +42,11 @@ OPERATIONS = {
     "script": "Run command script", "debug": "Save debug report", "font": "Choose font",
     "directory": "Export folder",
 }
-IMAGE_EXTENSIONS = (".png", ".tif", ".tiff", ".webp", ".jpg", ".jpeg", ".bmp", ".gif")
+IMAGE_EXTENSIONS = (".png", ".tif", ".tiff", ".webp", ".jpg", ".jpeg", ".bmp", ".gif", ".ora")
 READ_OPERATIONS = {"open", "import", "script", "font"}
 EXTENSIONS = {
     "open": (".tart", *IMAGE_EXTENSIONS), "import": IMAGE_EXTENSIONS,
-    "save": (".tart",), "export": (".png", ".tiff", ".webp", ".txt", ".ansi", ".jpg", ".gif", ".bmp"),
+    "save": (".tart",), "export": (".png", ".tiff", ".webp", ".ora", ".txt", ".ansi", ".jpg", ".gif", ".bmp"),
     "script": (".sparker", ".txt"), "debug": (".json",), "font": (".ttf", ".otf", ".ttc"), "directory": (),
 }
 DEFAULT_SUFFIX = {"save": ".tart", "export": ".png", "debug": ".json"}
@@ -143,6 +144,14 @@ def file_preview(path, *, max_width=22):
                     return information, Text()
             document = load_project(path)
             return information, _image_text(document.composite(), max_width)
+        if path.suffix.lower() == ".ora":
+            if details.st_size > MAX_PROJECT_PREVIEW_BYTES:
+                information.append("OpenRaster project is too large for the browser preview.")
+                return information, Text()
+            from .ora_tools import load_ora
+            document = load_ora(path)
+            information.append(f"OpenRaster · {document.width} × {document.height} pixels\n{len(document.layers)} layers\n")
+            return information, _image_text(document.composite(), max_width)
         if path.suffix.lower() in IMAGE_EXTENSIONS:
             with Image.open(path) as image:
                 information.append(f"{image.format} · {image.width} × {image.height} pixels · {image.mode}\n")
@@ -206,7 +215,9 @@ class FileExplorer(ModalScreen):
     FileExplorer #file-notice { color: $text-muted; height: auto; max-height: 2; }
     FileExplorer #path { width: 1fr; }
     FileExplorer #file-format { width: 16; }
+    FileExplorer #file-canvas-size { height: 1; color: $text-muted; }
     FileExplorer #columns { width: 12; }
+    FileExplorer #export-scale { width: 7; }
     FileExplorer #allow-lossy { width: 12; }
     FileExplorer #file-export-options Label { width: auto; margin: 1 1 0 1; }
     FileExplorer #file-actions { align-horizontal: right; }
@@ -217,7 +228,6 @@ class FileExplorer(ModalScreen):
     FileExplorer.file-compact #file-type { width: 16; }
     FileExplorer.file-compact #file-sort { width: 15; }
     FileExplorer.file-compact #file-hidden { width: 11; }
-    FileExplorer.file-compact #file-export-options Label:last-child { display: none; }
     """
     BINDINGS = [
         ("escape", "cancel", "Cancel"), ("alt+up", "up", "Up folder"),
@@ -228,7 +238,7 @@ class FileExplorer(ModalScreen):
 
     def __init__(self, operation="open", start_path=None, default_name="", *, config=None,
                  extensions=None, must_exist=None, title=None, allow_operations=False,
-                 validator=None, project_dir=None):
+                 validator=None, project_dir=None, canvas_size=None):
         super().__init__()
         if operation not in OPERATIONS:
             raise ValueError(f"Unknown file operation: {operation}.")
@@ -238,6 +248,10 @@ class FileExplorer(ModalScreen):
         self.must_exist = must_exist
         self.title_text = title
         self.allow_operations = allow_operations
+        if canvas_size is not None and (not isinstance(canvas_size, (tuple, list)) or len(canvas_size) != 2 or
+                any(type(value) is not int or value < 1 for value in canvas_size)):
+            raise ValueError("Canvas dimensions must be two positive integers.")
+        self.canvas_size = tuple(canvas_size) if canvas_size is not None else None
         self.project_dir = Path(project_dir or project_roots()[0]).expanduser().resolve()
         self.selected_path = None
         self.entries = []
@@ -331,12 +345,15 @@ class FileExplorer(ModalScreen):
                 yield Input(self.initial_filename, placeholder="Filename or full path", id="path")
                 yield Select([(suffix[1:].upper(), suffix) for suffix in EXTENSIONS["export"]],
                              value=".png", allow_blank=False, id="file-format")
+            yield Static(Text(f"Image: {self.canvas_size[0]}×{self.canvas_size[1]} px (canvas)")
+                         if self.canvas_size is not None else Text(), id="file-canvas-size")
             with Horizontal(id="file-export-options", classes="file-row"):
+                yield Label("Scale", id="file-scale-label")
+                yield Input(str(self.config.get("export.scale", 1)), id="export-scale")
                 yield Label("Text columns")
                 yield Input("100", id="columns")
                 yield Label("Allow lossy")
                 yield Select([("No", "no"), ("Yes", "yes")], value="no", allow_blank=False, id="allow-lossy")
-                yield Label("Images retain their original pixel dimensions.")
             with Horizontal(id="file-actions", classes="file-row"):
                 yield Button("New folder", id="file-new-folder")
                 yield Button("Select", variant="primary", id="file-submit")
@@ -370,6 +387,7 @@ class FileExplorer(ModalScreen):
         self.query_one("#path", Input).placeholder = "Folder path, or leave blank to select the current folder" if self.operation == "directory" else "Filename or full path"
         for selector in ("#file-format", "#file-export-options"):
             self.query_one(selector).set_class(self.operation != "export", "file-hide")
+        self._update_canvas_size()
         types = self.query_one("#file-type", Select)
         types.set_options(self._type_options())
         types.value = "supported"
@@ -505,6 +523,8 @@ class FileExplorer(ModalScreen):
             self.refresh_files()
         elif self._mounted_ready and event.input.id == "path":
             self._sync_format()
+        elif self._mounted_ready and event.input.id == "export-scale":
+            self._update_canvas_size()
 
     def _sync_format(self):
         """Reflect known suffixes without canonicalizing the entered filename."""
@@ -515,6 +535,42 @@ class FileExplorer(ModalScreen):
         selector = self.query_one("#file-format", Select)
         if canonical in EXTENSIONS["export"] and selector.value != canonical:
             selector.value = canonical
+        self._update_canvas_size()
+
+    def _update_canvas_size(self):
+        """Show output dimensions without modifying any editable canvas pixels."""
+        text_format = self.query_one("#file-format", Select).value in (".txt", ".ansi")
+        ora_format = self.query_one("#file-format", Select).value == ".ora"
+        image_export = self.operation == "export" and not text_format
+        for selector in ("#file-scale-label", "#export-scale"):
+            self.query_one(selector).set_class(not image_export or ora_format, "file-hide")
+        caption = self.query_one("#file-canvas-size", Static)
+        caption.set_class(not image_export or self.canvas_size is None, "file-hide")
+        if not image_export or self.canvas_size is None:
+            return
+        width, height = self.canvas_size
+        try:
+            scale = self._export_scale()
+            from .storage import export_dimensions
+            output = export_dimensions(self.canvas_size, scale,
+                                       extension=str(self.query_one("#file-format", Select).value))
+        except (ValueError, OverflowError) as error:
+            caption.update(Text(f"Image: {literal(error)}"))
+        else:
+            message = (f"Image: {width}×{height} px (canvas)" if scale == 1 else
+                       f"Image: {output[0]}×{output[1]} px · {scale}× crisp · canvas {width}×{height}")
+            caption.update(Text(message))
+
+    def _export_scale(self):
+        if self.query_one("#file-format", Select).value == ".ora":
+            return 1
+        try:
+            scale = int(self.query_one("#export-scale", Input).value)
+        except ValueError as error:
+            raise ValueError("Image scale must be an integer in 1..16.") from error
+        if not 1 <= scale <= 16:
+            raise ValueError("Image scale must be in 1..16.")
+        return scale
 
     def on_select_changed(self, event):
         if not self._mounted_ready or event.value is Select.BLANK or event.value != event.select.value:
@@ -555,6 +611,7 @@ class FileExplorer(ModalScreen):
             suffix = Path(field.value).suffix.lower()
             if field.value and FORMAT_ALIASES.get(suffix, suffix) != event.value:
                 field.value = str(Path(field.value).with_suffix(str(event.value)))
+            self._update_canvas_size()
 
     def on_checkbox_changed(self, event):
         if self._mounted_ready and event.checkbox.id == "file-hidden":
@@ -609,10 +666,15 @@ class FileExplorer(ModalScreen):
             raise ValueError("Debug reports use the .json extension.")
         if choice.operation == "export":
             if suffix not in (*EXTENSIONS["export"], ".tif", ".jpeg"):
-                raise ValueError("Choose PNG, TIFF, WebP, TXT, ANSI, or explicitly allowed JPEG, GIF, BMP.")
+                raise ValueError("Choose PNG, TIFF, WebP, ORA, TXT, ANSI, or explicitly allowed JPEG, GIF, BMP.")
             strict = self.config.get("export.lossless", True)
             if suffix in (".jpg", ".jpeg", ".gif", ".bmp") and strict and not choice.allow_lossy:
                 raise ValueError("This format cannot preserve every RGBA pixel. Choose PNG, TIFF or WebP, or explicitly allow lossy export.")
+            if suffix not in (".txt", ".ansi"):
+                if suffix == ".ora" and choice.scale != 1:
+                    raise ValueError("OpenRaster preserves layers at the original canvas size (scale 1).")
+                from .storage import export_dimensions
+                export_dimensions(self.canvas_size or (1, 1), choice.scale, extension=suffix)
         if choice.operation in ("export", "debug"):
             validate_export_directory(path)
             if path.is_relative_to(self.project_dir):
@@ -654,7 +716,7 @@ class FileExplorer(ModalScreen):
             if not path.suffix and self.operation in DEFAULT_SUFFIX:
                 suffix = str(self.query_one("#file-format", Select).value) if self.operation == "export" else DEFAULT_SUFFIX[self.operation]
                 path = path.with_suffix(suffix)
-            columns, allow_lossy = 100, False
+            columns, allow_lossy, scale = 100, False, 1
             if self.operation == "export":
                 try:
                     columns = int(self.query_one("#columns", Input).value)
@@ -663,7 +725,9 @@ class FileExplorer(ModalScreen):
                 if not 1 <= columns <= 500:
                     raise ValueError("Text columns must be in 1..500.")
                 allow_lossy = self.query_one("#allow-lossy", Select).value == "yes"
-            choice = FileChoice(path, self.operation, columns, allow_lossy)
+                if path.suffix.lower() not in (".txt", ".ansi"):
+                    scale = self._export_scale()
+            choice = FileChoice(path, self.operation, columns, allow_lossy, scale)
             choice = self.validate_choice(choice)
             if self.validator:
                 choice = self.validator(choice) or choice

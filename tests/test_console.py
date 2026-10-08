@@ -28,9 +28,9 @@ async def test_embedded_commands_edit_mouse_document_and_recall(tmp_path):
         assert field.value == "redo"
         await pilot.press("up")
         assert field.value == "undo"
-        field.value = "col"
+        field.value = "cle"
         await pilot.press("ctrl+space")
-        assert field.value == "color "
+        assert field.value == "clear "
         field.value = "view panels"
         await pilot.press("enter")
         assert app.screen_stack[0].has_class("zen")

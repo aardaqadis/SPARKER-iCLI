@@ -6,8 +6,9 @@ are committed through one bounded, whole-document undo history.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import copy
+import json
 from functools import lru_cache
 import math
 from collections import deque
@@ -18,7 +19,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFo
 MAX_PIXELS = 4_194_304
 MAX_LAYERS = 64
 MAX_DOCUMENT_BYTES = 128 * 1024 * 1024
-BLENDS = ("normal", "multiply", "screen", "overlay", "darken", "lighten", "difference", "add")
+BLENDS = ("normal", "multiply", "screen", "overlay", "darken", "lighten", "difference", "add", "subtract")
 PALETTE = ["#151b29", "#ffffff", "#e85d75", "#f6ae2d", "#f4e285", "#65c18c",
            "#2cb9c5", "#5a8dee", "#ad7be9", "#e48ac5", "#855d42", "#a0a9b8"]
 
@@ -51,10 +52,28 @@ class Layer:
     opacity: float = 1.0
     blend: str = "normal"
     mask: Image.Image | None = None
+    effects: list[dict] = field(default_factory=list)
+    text_recipe: dict | None = None
+
+    def pixels_with_effects(self):
+        if not self.effects:
+            return self.image
+        from .document_tools import render_effects
+        key = (id(self.image), repr(self.effects))
+        if not getattr(self, "cache_effects", True):
+            return render_effects(self.image, self.effects)
+        if getattr(self, "_effects_key", None) != key:
+            self._effects_pixels = render_effects(self.image, self.effects)
+            self._effects_key = key
+        return self._effects_pixels
+
+    def invalidate_effects(self):
+        self._effects_key = self._effects_pixels = None
 
     def clone(self):
         return Layer(self.name, self.image.copy(), self.visible, self.locked,
-                     self.opacity, self.blend, self.mask.copy() if self.mask else None)
+                     self.opacity, self.blend, self.mask.copy() if self.mask else None,
+                     copy.deepcopy(self.effects), copy.deepcopy(self.text_recipe))
 
     def rendered(self, box=None, *, copy=True):
         """Render a layer region; callers may borrow unmodified pixels internally.
@@ -62,7 +81,8 @@ class Layer:
         The public default still returns an independent image. Compositing can
         avoid a full RGBA copy when there is no mask or opacity adjustment.
         """
-        result = self.image.crop(box) if box is not None else self.image
+        source = self.pixels_with_effects()
+        result = source.crop(box) if box is not None else source
         if self.mask is None and self.opacity == 1:
             return result.copy() if copy and box is None else result
         if box is None:
@@ -111,17 +131,21 @@ class _HistoryLayer:
     opacity: float
     blend: str
     mask: _HistoryImage | None
+    effects: list[dict] = field(default_factory=list)
+    text_recipe: dict | None = None
 
     @classmethod
     def capture(cls, layer):
         if isinstance(layer, cls):
             return layer
         return cls(layer.name, _HistoryImage.capture(layer.image), layer.visible,
-                   layer.locked, layer.opacity, layer.blend, _HistoryImage.capture(layer.mask))
+                   layer.locked, layer.opacity, layer.blend, _HistoryImage.capture(layer.mask),
+                   copy.deepcopy(layer.effects), copy.deepcopy(layer.text_recipe))
 
     def restore(self):
         return Layer(self.name, self.image.restore(), self.visible, self.locked,
-                     self.opacity, self.blend, self.mask.restore() if self.mask else None)
+                     self.opacity, self.blend, self.mask.restore() if self.mask else None,
+                     copy.deepcopy(self.effects), copy.deepcopy(self.text_recipe))
 
 
 def composite_layer(back, front, blend="normal"):
@@ -132,7 +156,7 @@ def composite_layer(back, front, blend="normal"):
     functions = {"multiply": ImageChops.multiply, "screen": ImageChops.screen,
                  "overlay": ImageChops.overlay, "darken": ImageChops.darker,
                  "lighten": ImageChops.lighter, "difference": ImageChops.difference,
-                 "add": ImageChops.add}
+                 "add": ImageChops.add, "subtract": ImageChops.subtract}
     mixed = functions[blend](b, s)
     # An absent backdrop must not affect source RGB.
     rgb = Image.composite(mixed, s, back.getchannel("A"))
@@ -158,9 +182,13 @@ class Document:
         self.saved_revision = 0
         self.serial = 0
         self.clipboard = None
+        # Current terminal sampling is session state; native projects retain
+        # only editable artwork and never persist this display hint.
+        self.export_view = None
         self.history_limit = 40
         self.history_bytes = 96 * 1024 * 1024
         self._history_storage = "raw"
+        self.cache_effects = True
 
     @property
     def size(self):
@@ -201,7 +229,7 @@ class Document:
 
     @staticmethod
     def _snapshot_bytes(state):
-        """Stored pixel payload, including masks and selections in either mode."""
+        """Stored pixels and editable tool data in either history mode."""
         def image_bytes(image):
             if image is None:
                 return 0
@@ -209,8 +237,16 @@ class Document:
                 return len(image.data)
             return image.width * image.height * len(image.getbands())
 
-        _, layers, _, selection, *_ = state
-        return sum(image_bytes(layer.image) + image_bytes(layer.mask) for layer in layers) + image_bytes(selection)
+        _, layers, _, selection, metadata, settings, _ = state
+        # Keep fixed bookkeeping out of the pixel budget, but account for the
+        # potentially large saved channels, paths, effects and text recipes.
+        editable = {key: value for key, value in metadata.items()
+                    if key not in ("title", "guides_x", "guides_y", "grid_spacing")}
+        tool_data = [editable, *[layer.effects for layer in layers if layer.effects],
+                     *[layer.text_recipe for layer in layers if layer.text_recipe]]
+        extra = sum(len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+                    for value in tool_data if value)
+        return sum(image_bytes(layer.image) + image_bytes(layer.mask) for layer in layers) + image_bytes(selection) + extra
 
     @property
     def history_memory_bytes(self):
@@ -236,6 +272,7 @@ class Document:
         size, layers, self.active, selection, metadata, settings, self.revision = state
         self.width, self.height = size
         self.layers = [layer.restore() if isinstance(layer, _HistoryLayer) else layer.clone() for layer in layers]
+        for layer in self.layers: layer.cache_effects = self.cache_effects
         self.selection = (selection.restore() if isinstance(selection, _HistoryImage)
                           else selection.copy() if selection else None)
         self.metadata, self.settings = copy.deepcopy(metadata), copy.deepcopy(settings)
@@ -244,6 +281,8 @@ class Document:
         if self.pending is not None:
             raise RuntimeError("An edit is already in progress")
         self.pending = (label, self.snapshot())
+        for layer in self.layers:
+            layer.invalidate_effects()
 
     def commit(self):
         if self.pending is None:
@@ -255,6 +294,8 @@ class Document:
         self.redo_stack.clear()
         self.serial += 1
         self.revision = self.serial
+        for layer in self.layers:
+            layer.invalidate_effects()
         self._trim()
 
     def _trim(self):
@@ -319,6 +360,7 @@ class Document:
         result = Image.new("RGBA", size)
         for layer in self.layers:
             if layer.visible:
+                layer.cache_effects = self.cache_effects
                 result = composite_layer(result, layer.rendered(box, copy=False), layer.blend)
         return result
 
@@ -337,7 +379,8 @@ class Document:
         for layer in self.layers:
             if not layer.visible:
                 continue
-            front = layer.image.transform(size, Image.Transform.AFFINE, affine, resampling)
+            layer.cache_effects = self.cache_effects
+            front = layer.pixels_with_effects().transform(size, Image.Transform.AFFINE, affine, resampling)
             if layer.mask is not None or layer.opacity != 1:
                 alpha = front.getchannel("A")
                 if layer.mask is not None:
@@ -361,6 +404,7 @@ class Document:
         update their changed pixels without copying a multi-megapixel image.
         """
         self.ensure_editable()
+        self.layer.invalidate_effects()
         opacity = _opacity(opacity)
         base = self.layer.image if base is None else base
         local = box is not None
@@ -546,12 +590,43 @@ class Document:
         ink.putalpha(ImageChops.multiply(ink.getchannel("A"), mask))
         self.layer.image = Image.alpha_composite(self.layer.image, ink)
 
-    def text(self, point, text, color, size=12, font_path="", opacity=1):
-        self.ensure_editable()
-        font = ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default(size=size)
-        mask = Image.new("L", self.size)
-        ImageDraw.Draw(mask).multiline_text(point, text, font=font, fill=255, spacing=2)
-        self.paint_mask(mask, color, opacity)
+    def text(self, point, text, color, size=12, font_path="", opacity=1, *,
+             wrap=None, align="left", spacing=2, letter_spacing=0, stroke=0,
+             stroke_color="black", shadow=None, shadow_color="#00000080",
+             rotation=0, anchor="top-left", new_layer=None, _rendered=None):
+        """Draw raster text with shared CLI layout, clipped to the selection.
+
+        Callers retain ownership of the edit transaction, as with other drawing
+        operations. Text layouts are independent of terminal zoom and sampling.
+        """
+        from .text_tools import TextStyle, render_text
+        if new_layer is None:
+            self.ensure_editable()
+        if len(point) != 2 or any(not isinstance(value, (int, float)) or
+                not math.isfinite(value) or abs(value) > 1_000_000 for value in point):
+            raise ValueError("Text coordinates must be finite numbers within ±1,000,000.")
+        style = TextStyle(size, font_path, wrap, align, spacing, letter_spacing,
+                          stroke, stroke_color, shadow, shadow_color, rotation,
+                          _opacity(opacity), anchor)
+        rendered = _rendered if _rendered is not None else render_text(text, color, style)
+        if new_layer is not None:
+            self.add_layer(new_layer)
+            self.layer.text_recipe = {"point": list(point), "text": text, "color": color,
+                "size": size, "font_path": font_path, "opacity": opacity, "wrap": wrap,
+                "align": align, "spacing": spacing, "letter_spacing": letter_spacing,
+                "stroke": stroke, "stroke_color": stroke_color, "shadow": shadow,
+                "shadow_color": shadow_color, "rotation": rotation, "anchor": anchor}
+        x, y = rendered.origin(point)
+        left, top = max(0, x), max(0, y)
+        right, bottom = min(self.width, x + rendered.image.width), min(self.height, y + rendered.image.height)
+        if right <= left or bottom <= top:
+            return rendered
+        ink = rendered.image.crop((left - x, top - y, right - x, bottom - y))
+        if self.selection is not None:
+            ink.putalpha(ImageChops.multiply(ink.getchannel("A"), self.selection.crop((left, top, right, bottom))))
+        existing = self.layer.image.crop((left, top, right, bottom))
+        self.layer.image.paste(Image.alpha_composite(existing, ink), (left, top))
+        return rendered
 
     def add_layer(self, name="Layer", image=None):
         if not isinstance(name, str) or len(name) > 256:
@@ -562,8 +637,11 @@ class Document:
             raise ValueError("Adding a layer would exceed the 128 MiB project pixel budget.")
         if image is not None and image.size != self.size:
             raise ValueError("Layer size differs from canvas.")
-        self.active += 1
-        self.layers.insert(self.active, Layer(name, image.convert("RGBA") if image is not None else Image.new("RGBA", self.size)))
+        prepared = image.convert("RGBA") if image is not None else Image.new("RGBA", self.size)
+        index = self.active + 1
+        self.layers.insert(index, Layer(name, prepared))
+        self.active = index
+        self.layer.cache_effects = self.cache_effects
 
     def duplicate(self):
         source = self.layer.clone()
@@ -595,31 +673,98 @@ class Document:
         result = Image.new("RGBA", self.size)
         result.paste(source, (int(dx), int(dy)))
         self.layer.image = result
+        if self.layer.text_recipe:
+            original_recipe = self.layer.text_recipe
+            if base is not None and self.pending:
+                checkpoint = self.pending[1][1][self.active]
+                if base is checkpoint.image and checkpoint.text_recipe:
+                    original_recipe = checkpoint.text_recipe
+            x, y = original_recipe["point"]
+            self.layer.text_recipe["point"] = [x + int(dx), y + int(dy)]
         source_mask = mask_base if mask_base is not None else self.layer.mask
         if source_mask is not None:
             mask = Image.new("L", self.size)
             mask.paste(source_mask, (int(dx), int(dy)))
             self.layer.mask = mask
 
-    def copy_selection(self, cut=False):
-        if cut: self.ensure_editable()
-        mask = self.selection if self.selection is not None else Image.new("L", self.size, 255)
-        box = mask.getbbox()
-        if box is None:
-            raise ValueError("The selection is empty.")
-        image = self.layer.image.copy()
-        image.putalpha(ImageChops.multiply(image.getchannel("A"), mask))
-        self.clipboard = (image.crop(box), box[:2])
-        if cut:
-            self.paint_mask(Image.new("L", self.size, 255), "black", erase=True)
+    def copy_selection(self, cut=False, *, merged=False, box=None):
+        """Copy selected visible pixels without losing their alpha or origin.
 
-    def paste(self):
-        if self.clipboard is None:
+        Explicit boxes use Pillow's half-open pixel bounds and intersect the
+        existing selection. Cutting always edits the active layer only.
+        """
+        if cut:
+            self.ensure_editable()
+            if merged:
+                raise ValueError("Cut works on the active layer; use copy --merged for visible layers.")
+        mask = self.selection.copy() if self.selection is not None else Image.new("L", self.size, 255)
+        if box is not None:
+            if len(box) != 4 or any(type(value) is not int for value in box):
+                raise ValueError("Copy bounds must contain four integers.")
+            x0, y0, x1, y1 = box
+            if x1 <= x0 or y1 <= y0:
+                raise ValueError("Copy bounds require X1 > X0 and Y1 > Y0.")
+            clipped = (max(0, x0), max(0, y0), min(self.width, x1), min(self.height, y1))
+            bounds = Image.new("L", self.size)
+            if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
+                bounds.paste(255, clipped)
+            mask = ImageChops.multiply(mask, bounds)
+        selection_box = mask.getbbox()
+        if selection_box is None:
+            raise ValueError("The selection is empty.")
+        image = self.composite(selection_box) if merged else self.layer.rendered(selection_box)
+        image.putalpha(ImageChops.multiply(image.getchannel("A"), mask.crop(selection_box)))
+        # Prepare the edit before publishing the new clipboard; validation and
+        # allocation failures leave the previous clipboard available.
+        cut_image = None
+        if cut:
+            cut_image = self.layer.image.copy()
+            cut_image.putalpha(ImageChops.multiply(cut_image.getchannel("A"), ImageOps.invert(mask)))
+        self.clipboard = (image, selection_box[:2])
+        if cut:
+            self.layer.image = cut_image
+
+    def paste(self, position=None, *, image=None, into=False, name="Pasted", opacity=1.0, positions=None):
+        """Paste to a new layer or alpha-composite into the editable layer.
+
+        The clipboard itself is never transformed or consumed. New-layer paste
+        retains raw clipboard RGBA; --into obeys the current selection.
+        """
+        if self.clipboard is None and image is None:
             raise ValueError("Copy a selection first.")
-        image, position = self.clipboard
+        source = self.clipboard[0] if image is None else image
+        if source.mode != "RGBA":
+            raise ValueError("Clipboard images must contain RGBA pixels.")
+        valid_size(*source.size)
+        opacity = float(opacity)
+        if not math.isfinite(opacity) or not 0 <= opacity <= 1:
+            raise ValueError("Paste opacity must be between 0 and 1.")
+        if not isinstance(name, str) or len(name) > 256:
+            raise ValueError("Layer names must contain at most 256 characters.")
+        if into:
+            self.ensure_editable()
+        if positions is None:
+            point = position if position is not None else self.clipboard[1] if self.clipboard else (0, 0)
+            positions = [point]
+        if not positions or len(positions) > 256:
+            raise ValueError("Paste accepts at most 256 positions.")
+        if any(len(point) != 2 or any(type(value) is not int for value in point) for point in positions):
+            raise ValueError("Paste positions must contain integer X,Y coordinates.")
         full = Image.new("RGBA", self.size)
-        full.paste(image, position)
-        self.add_layer("Pasted", full)
+        if len(positions) == 1:
+            full.paste(source, positions[0])
+        else:
+            for point in positions:
+                full.alpha_composite(source, point)
+        if into:
+            if opacity != 1:
+                full.putalpha(full.getchannel("A").point(_opacity_table(opacity)))
+            if self.selection is not None:
+                full.putalpha(ImageChops.multiply(full.getchannel("A"), self.selection))
+            self.layer.image = Image.alpha_composite(self.layer.image, full)
+        else:
+            self.add_layer(name, full)
+            self.layer.opacity = opacity
 
     def apply_filter(self, name, amount=1.0):
         self.ensure_editable()
@@ -654,6 +799,7 @@ class Document:
             return result
         self.layer.image = transform(self.layer.image)
         if self.layer.mask is not None: self.layer.mask = transform(self.layer.mask)
+        self.layer.text_recipe = None
 
     def resize(self, width, height, resample=True):
         valid_size(width, height)
@@ -682,11 +828,14 @@ class Document:
             self.metadata["guides_x"] = [round(x * width/old[0]) for x in self.metadata["guides_x"]]
             self.metadata["guides_y"] = [round(y * height/old[1]) for y in self.metadata["guides_y"]]
         self.width, self.height = width, height
+        from .document_tools import transform_metadata
+        transform_metadata(self, old, self.size, resample=resample)
 
     def crop_selection(self):
         if self.selection is None or self.selection.getbbox() is None:
             raise ValueError("Select an area first.")
         box = self.selection.getbbox()
+        old = self.size
         for layer in self.layers:
             layer.image = layer.image.crop(box)
             if layer.mask is not None: layer.mask = layer.mask.crop(box)
@@ -694,3 +843,5 @@ class Document:
         self.selection = None
         self.metadata["guides_x"] = [x-box[0] for x in self.metadata["guides_x"] if box[0] <= x < box[2]]
         self.metadata["guides_y"] = [y-box[1] for y in self.metadata["guides_y"] if box[1] <= y < box[3]]
+        from .document_tools import transform_metadata
+        transform_metadata(self, old, self.size, crop=box, resample=False)

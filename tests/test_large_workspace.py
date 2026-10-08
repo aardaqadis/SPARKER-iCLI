@@ -23,6 +23,7 @@ class Process:
 
 @pytest.mark.asyncio
 async def test_cli_information_reuses_megapixel_preview(tmp_path, monkeypatch):
+    monkeypatch.setattr("termatelier.preview.desktop_available", lambda: True)
     monkeypatch.setattr("termatelier.preview.subprocess.Popen", lambda *a, **kw: Process())
     doc = Document(1024, 1024)
     preview = PreviewController()
