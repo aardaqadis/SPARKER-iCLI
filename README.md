@@ -3,20 +3,11 @@
 <img src="src/termatelier/assets/logo.png" alt="SPARKER iCLI" width="420">
 
 Ever had the need to have MS paint in your command prompt? No? Download it anyway!
- 
-A terminal paint editor with mouse drawing, layers, selections, brushes, shapes,
-filters, undo/redo and **1,248 art tools**. The CLI also supports image copy/paste,
-curves, pixel edits, selection adjustments and advanced text layout.
-Native tools also include clone/heal, airbrush, smudge, foreground/scissors
-selections, perspective/warp transforms, color curves, editable paths, saved
-channels, text source editing and layer effect stacks. Type `features` for
-the tool families and their limits; these use SPARKER's own raster algorithms.
+
+Holding around many more features than conventional raster canvas editors, this program has support for Windows, Linux and MacOS* systems, with high quality pixel drawings.
+Unusually, this program has mouse support, meaning that your command line interrace transforms into a quicker and an ease-of-use factor.
 
 ## Start
-=======
-=======
-SPARKER iCLI is a raster canvas editor inside of any command line interface. Consuming less memory than Microsoft paint, it offers an optimised way of digitally producing art.
-
 
 Install **Python 3.11+**, then run from this folder:
 
